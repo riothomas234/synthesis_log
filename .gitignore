@@ -182,7 +182,9 @@ cython_debug/
 
 # synthesis_log runtime artifacts (design.md) — generated, not source
 synthlog.jsonl
+checkpoints.jsonl
 attack_demo.jsonl
+attack_demo_checkpoints.jsonl
 *.jsonl.bak
 device_private_key.pem
 device_public_key.pem
