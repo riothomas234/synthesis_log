@@ -17,7 +17,8 @@ matters most for this project.
 Depends on the `cryptography` package for Ed25519 (design.md §3):
     pip install cryptography
 """
-
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+from sequence_crypto import encrypt_sequence
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -32,7 +33,7 @@ from merkletree import hash_leaf
 # Deliberately does NOT include entry_hash or signature — see
 # compute_entry_hash below and the "BE EXACT" section of §5.
 
-ENTRY_FIELDS = ("index", "timestamp", "seq_commit", "metadata")
+ENTRY_FIELDS = ("index", "timestamp", "seq_ciphertext", "metadata")
 
 
 
@@ -144,30 +145,24 @@ import hashlib
 def compute_leaf_hash(
     index: int,
     timestamp: str,
-    seq_commit: str,
+    seq_ciphertext: str,
     metadata: dict,
 ) -> bytes:
     """
-    Replaces compute_entry_hash. A leaf's hash covers exactly
-    ENTRY_FIELDS — the same three build steps as before (build the
-    field dict, canonical()-serialize it, hash the result), except the
-    hash itself now goes through merkletree.hash_leaf rather than raw
-    hashlib.sha256. That's not a cosmetic swap: hash_leaf applies the
-    domain-separation prefix (design.md's tree section) that keeps a
-    leaf's hash from ever being confused with an internal tree node's
-    hash. Hashing a leaf the same way as a node would quietly reopen
-    the exact forgery weakness the tree exists to close.
-
-    Also used independently by verify.py's root-integrity check: it
-    recomputes every stored entry's leaf hash from the entry's own
-    fields, rebuilds the tree via merkletree.compute_root, and compares
-    the result to a signed checkpoint's root_hash — the replacement for
-    the old chain-linkage + hash-integrity checks combined into one.
+    Same shape as before this change — only the parameter name moved
+    from seq_commit to seq_ciphertext. Still just canonical() + hash_leaf
+    over ENTRY_FIELDS; this function doesn't know or care that the third
+    field is now ciphertext instead of a hash. That's the point: routine
+    tamper-checking (verify.py's check_root_integrity calls this exact
+    function) never needs to decrypt anything — it just re-hashes
+    whatever bytes are already stored, the same way it already does for
+    every other field. Tampering with seq_ciphertext is caught here
+    exactly like tampering with metadata always was.
     """
     entry_fields = {
         "index": index,
         "timestamp": timestamp,
-        "seq_commit": seq_commit,
+        "seq_ciphertext": seq_ciphertext,
         "metadata": metadata,
     }
     serialized = canonical(entry_fields)
@@ -198,32 +193,45 @@ def sign_root(root_hash: bytes, private_key: Ed25519PrivateKey) -> bytes:
 
 
 
+
 def build_entry(
     index: int,
     timestamp: str,
-    seq_commit: str,
+    raw_sequence: str,
     metadata: dict,
+    auditor_public_key: X25519PublicKey,
 ) -> dict:
     """
-    Replaces the old build_entry. No prev_hash parameter, no signature
-    — an individual entry is no longer signed on its own; only the tree
-    ROOT gets signed (via build_checkpoint below). This function's only
-    job now is bundling an entry's fields with its own leaf_hash for
-    log.py to store in synthlog.jsonl.
+    The one real behavior change from before: takes raw_sequence and
+    auditor_public_key instead of a pre-made seq_commit, and actually
+    performs the encryption here via sequence_crypto.encrypt_sequence.
+
+    raw_sequence exists only for the duration of this call — it gets
+    consumed into seq_ciphertext below and never assigned anywhere else,
+    never written to disk in its own right. This is the first (and only)
+    place in the codebase a raw sequence is ever handled directly; every
+    other function only ever sees seq_ciphertext.
+
+    seq_ciphertext is raw bytes coming out of encrypt_sequence, hex-encoded
+    here for storage — same inspectability convention as leaf_hash and
+    signature elsewhere in this file.
     """
+    seq_ciphertext = encrypt_sequence(raw_sequence, auditor_public_key).hex()
+
     leaf_hash = compute_leaf_hash(
         index=index,
         timestamp=timestamp,
-        seq_commit=seq_commit,
+        seq_ciphertext=seq_ciphertext,
         metadata=metadata,
     )
     return {
         "index": index,
         "timestamp": timestamp,
-        "seq_commit": seq_commit,
+        "seq_ciphertext": seq_ciphertext,
         "metadata": metadata,
         "leaf_hash": leaf_hash.hex(),
     }
+
 
 
 

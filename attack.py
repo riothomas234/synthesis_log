@@ -1,34 +1,43 @@
 """
 attack.py — adversarial test harness.
 
-Spec: design.md §9, §11 (acceptance demo) — updated for the Merkle-tree
-+ signed-checkpoint design.
+Spec: design.md §9, §13 (acceptance demo) — updated for the encrypted-
+sequence design (seq_ciphertext replaces seq_commit; see design.md §8).
 
 Written by the agent (design.md marks this file as agent-OK). Plays the
 role of the operator-adversary from design.md §2: full filesystem access
-to synthlog.jsonl and checkpoints.jsonl, no access to the private key.
+to synthlog.jsonl and checkpoints.jsonl, no access to the device's
+private signing key, no access to the auditor's private decryption key.
+They DO have the auditor's PUBLIC key — it's provisioned to the device,
+not secret (see sequence_crypto.py) — so they can produce valid-looking
+ciphertext, just never decrypt anything or forge a signature.
+
 Each attack_* function below corresponds to one of the adversary goals
 listed in §2. run_acceptance_demo() at the bottom reproduces the
 acceptance demo:
 
-    append 3 entries             -> verify: OK
-    delete entry 1                -> verify: tree size mismatch
-    modify entry 1 metadata       -> verify: root mismatch
-    modify + forge checkpoint     -> verify: signature invalid
+    append 3 entries               -> verify: OK
+    delete entry 1                 -> verify: tree size mismatch
+    modify entry 1 metadata        -> verify: root mismatch
+    swap entry 1 ciphertext        -> verify: root mismatch
+    modify + forge checkpoint      -> verify: signature invalid
 
-The shape of this story changed from the original hash-chain version:
-delete and modify used to be caught by two DIFFERENT checks (chain
-linkage vs. hash integrity), so they got two distinguishable error
-messages. In a Merkle tree, ANY change to ANY entry changes the tree's
-root, so both are now caught by the SAME check (check_root_integrity) —
-see verify.py's docstring for why that's a deliberate tradeoff (losing
-per-entry localization) rather than a weaker guarantee. The LAST row is
-still the actual thesis of the project: an operator with root access
-can recompute a tampered tree's root correctly, but cannot forge the
-checkpoint's signature over it, so the tamper is still caught. Everything
-before it exists to make that payoff land — you have to see the weaker
-attacks get caught by the weaker check first to understand why the
-signature layer is the one that matters.
+The new fourth row (swap entry 1 ciphertext) exists specifically to
+validate a claim from this project's design discussion: that
+seq_ciphertext being opaque (even to someone with full log access)
+doesn't make it a blind spot. It still feeds into leaf_hash exactly like
+every other field, so swapping it for a differently-encrypted sequence
+is caught by check_root_integrity the same way a metadata edit is — the
+operator can produce VALID ciphertext (they have the auditor's public
+key), just not ciphertext that reproduces the original leaf_hash without
+also knowing what was actually inside it.
+
+The LAST row is still the actual thesis of the project: an operator with
+root access can recompute a tampered tree's root correctly, but cannot
+forge the checkpoint's signature over it, so the tamper is still caught.
+Everything before it exists to make that payoff land — you have to see
+the weaker attacks get caught by the weaker check first to understand
+why the signature layer is the one that matters.
 
 Deliberately reads/writes the JSONL files directly with plain json
 (rather than going through log.py's append_entry) because the adversary
@@ -41,11 +50,14 @@ import os
 
 from canonical import canonical
 from logentry import generate_keypair
+from sequence_crypto import generate_auditor_keypair, encrypt_sequence
 from log import append_entry
 from verify import verify_log
 
 DEMO_LOG_PATH = "attack_demo.jsonl"
 DEMO_CHECKPOINTS_PATH = "attack_demo_checkpoints.jsonl"
+DEMO_AUDITOR_PRIVATE_KEY_PATH = "attack_demo_auditor_keys/auditor_private_key.pem"
+DEMO_AUDITOR_PUBLIC_KEY_PATH = "attack_demo_auditor_keys/auditor_public_key.pem"
 
 
 def _load_lines(path: str) -> list[dict]:
@@ -64,7 +76,13 @@ def _save_lines(path: str, entries: list[dict]) -> None:
             f.write(canonical(entry).decode("utf-8") + "\n")
 
 
-def _fresh_log(path: str, checkpoints_path: str, private_key, n: int = 3) -> None:
+def _fresh_log(
+    path: str,
+    checkpoints_path: str,
+    private_key,
+    auditor_public_key,
+    n: int = 3,
+) -> None:
     """Build a clean, honestly-signed n-entry log (and its matching
     checkpoints) at `path`/`checkpoints_path`, deleting anything
     already there. Each demo row starts from this known-good state so
@@ -74,9 +92,10 @@ def _fresh_log(path: str, checkpoints_path: str, private_key, n: int = 3) -> Non
             os.remove(p)
     for i in range(n):
         append_entry(
-            seq_commit=f"deadbeef{i:04d}",
+            raw_sequence=f"ACGT{'ACGT' * i}TTAACCGG",
             metadata={"length_bp": 100 + i},
             private_key=private_key,
+            auditor_public_key=auditor_public_key,
             path=path,
             checkpoints_path=checkpoints_path,
         )
@@ -115,9 +134,36 @@ def attack_modify_metadata(path: str, index: int, new_metadata: dict) -> None:
     _save_lines(path, entries)
 
 
+def attack_swap_ciphertext(path: str, index: int, auditor_public_key) -> None:
+    """
+    New adversary tactic, enabled by encryption replacing seq_commit:
+    swap a specific entry's seq_ciphertext for the encryption of a
+    DIFFERENT sequence, without touching checkpoints.jsonl. The operator
+    has the auditor's PUBLIC key — it's provisioned to the device, not
+    secret (sequence_crypto.py's central asymmetry) — so they can
+    produce perfectly VALID ciphertext, just for the wrong content.
+
+    This validates a specific claim from the design discussion: that
+    seq_ciphertext being opaque doesn't make it a blind spot for routine
+    verification. It still feeds into leaf_hash exactly like every other
+    field, so this is caught by check_root_integrity's root comparison
+    the same way attack_modify_metadata is — the operator being able to
+    produce valid-LOOKING ciphertext doesn't help them reproduce the
+    original leaf_hash without knowing what was actually encrypted
+    inside it originally.
+    """
+    entries = _load_lines(path)
+    for e in entries:
+        if e["index"] == index:
+            e["seq_ciphertext"] = encrypt_sequence(
+                "GATTACAGATTACAGATTACA", auditor_public_key
+            ).hex()
+    _save_lines(path, entries)
+
+
 def attack_forge_checkpoint(path: str, checkpoints_path: str) -> None:
     """
-    The payoff attack (design.md §11's analogue in this design): after
+    The payoff attack (design.md §13's analogue in this design): after
     tampering with entries (attack_modify_metadata above), an operator
     with root access recomputes the CORRECT new root from the CURRENT
     (tampered) entries and overwrites the last checkpoint to claim that
@@ -147,7 +193,7 @@ def attack_forge_checkpoint(path: str, checkpoints_path: str) -> None:
         compute_leaf_hash(
             index=e["index"],
             timestamp=e["timestamp"],
-            seq_commit=e["seq_commit"],
+            seq_ciphertext=e["seq_ciphertext"],
             metadata=e["metadata"],
         )
         for e in entries
@@ -168,27 +214,35 @@ def attack_forge_checkpoint(path: str, checkpoints_path: str) -> None:
 
 def run_acceptance_demo() -> None:
     """Reproduces the acceptance demo row by row, printing results to
-    stdout. Each row rebuilds a fresh, honest log first so the four
-    scenarios don't interfere with each other (except the last, which
-    deliberately builds "modify" and "forge checkpoint" on top of one
-    another, matching the structure of the original demo)."""
+    stdout. Each row rebuilds a fresh, honest log first so the scenarios
+    don't interfere with each other (except the last, which deliberately
+    builds "modify" and "forge checkpoint" on top of one another,
+    matching the structure of the original demo)."""
     private_key, public_key = generate_keypair()
+    auditor_private_key, auditor_public_key = generate_auditor_keypair(
+        private_key_path=DEMO_AUDITOR_PRIVATE_KEY_PATH,
+        public_key_path=DEMO_AUDITOR_PUBLIC_KEY_PATH,
+    )
 
-    _fresh_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, private_key)
-    print(f"append 3 entries             -> verify: {verify_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, public_key)}")
+    _fresh_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, private_key, auditor_public_key)
+    print(f"append 3 entries               -> verify: {verify_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, public_key)}")
 
-    _fresh_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, private_key)
+    _fresh_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, private_key, auditor_public_key)
     attack_delete_entry(DEMO_LOG_PATH, 1)
-    print(f"delete entry 1                -> verify: {verify_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, public_key)}")
+    print(f"delete entry 1                 -> verify: {verify_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, public_key)}")
 
-    _fresh_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, private_key)
+    _fresh_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, private_key, auditor_public_key)
     attack_modify_metadata(DEMO_LOG_PATH, 1, {"length_bp": 999})
-    print(f"modify entry 1 metadata       -> verify: {verify_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, public_key)}")
+    print(f"modify entry 1 metadata        -> verify: {verify_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, public_key)}")
 
-    _fresh_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, private_key)
+    _fresh_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, private_key, auditor_public_key)
+    attack_swap_ciphertext(DEMO_LOG_PATH, 1, auditor_public_key)
+    print(f"swap entry 1 ciphertext        -> verify: {verify_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, public_key)}")
+
+    _fresh_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, private_key, auditor_public_key)
     attack_modify_metadata(DEMO_LOG_PATH, 1, {"length_bp": 999})
     attack_forge_checkpoint(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH)
-    print(f"modify + forge checkpoint     -> verify: {verify_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, public_key)}")
+    print(f"modify + forge checkpoint      -> verify: {verify_log(DEMO_LOG_PATH, DEMO_CHECKPOINTS_PATH, public_key)}")
 
     os.remove(DEMO_LOG_PATH)
     os.remove(DEMO_CHECKPOINTS_PATH)

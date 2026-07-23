@@ -83,9 +83,10 @@ def get_last_checkpoint(path: str = DEFAULT_CHECKPOINTS_PATH) -> dict | None:
 
 
 def append_entry(
-    seq_commit: str,
+    raw_sequence: str,
     metadata: dict,
     private_key,
+    auditor_public_key,
     path: str = DEFAULT_LOG_PATH,
     checkpoints_path: str = DEFAULT_CHECKPOINTS_PATH,
 ) -> dict:
@@ -97,7 +98,12 @@ def append_entry(
 
     Two writes happen here, in order:
       1. The entry itself (unsigned — see logentry.build_entry; only
-         checkpoints get signed now, not individual entries).
+         checkpoints get signed now, not individual entries). raw_sequence
+         and auditor_public_key are passed straight through to
+         logentry.build_entry, which is the only place a raw sequence is
+         ever handled — this function never sees seq_ciphertext's
+         contents as anything other than an opaque field in the dict
+         build_entry hands back.
       2. A checkpoint: the ENTIRE tree gets rebuilt from every entry now
          on disk (including the one just written), and the resulting
          root gets signed fresh. This is "sign every append" per the
@@ -121,8 +127,9 @@ def append_entry(
     entry = build_entry(
         index=index,
         timestamp=timestamp,
-        seq_commit=seq_commit,
+        raw_sequence=raw_sequence,
         metadata=metadata,
+        auditor_public_key=auditor_public_key,
     )
 
     with open(path, "a", encoding="utf-8") as f:

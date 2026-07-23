@@ -11,9 +11,12 @@ Record DNA synthesis events into an append-only log such that any later
 deletion, modification, reordering, or forgery of entries is **detectable**
 by a verifier who does not trust the operator of the device.
 
-This is an integrity / non-repudiation system, not a confidentiality system.
-It does not screen sequences (cf. SecureDNA, which does). It proves that a
-record of a synthesis event exists and has not been altered.
+This is an integrity / non-repudiation system. It does not screen
+sequences (cf. SecureDNA, which does). It proves that a record of a
+synthesis event exists and has not been altered — and, since §8's
+encryption design, it also lets an authorized auditor recover the actual
+sequence for function screening and forensic matching, while keeping it
+unreadable to anyone else who might obtain the log or the device.
 
 ---
 
@@ -28,10 +31,15 @@ Adversary capabilities:
 - Physical possession of the device.
 - Root-level software access.
 - May be able to reflash firmware.
+- Has the auditor's PUBLIC encryption key (it's provisioned to the device,
+  not secret — see §8) — so they can produce valid-*looking* ciphertext,
+  just never decrypt anything or forge a signature.
 
 Adversary limitations (assumptions the guarantees rest on):
 - Cannot break SHA-256 (preimage / second-preimage / collision resistance).
 - Cannot extract a private key held inside a secure element (SE).
+- Does not have the auditor's PRIVATE decryption key — that key never
+  touches the device at all (§8).
 
 Adversary goals, in order:
 1. Delete a log entry (destroy record of a flagged synthesis).
@@ -49,6 +57,8 @@ detectable ≠ preventable — see §9.
 
 - **Hash:** SHA-256.
 - **Signatures:** Ed25519 (fast, small keys, deterministic, well-understood).
+- **Sequence encryption:** X25519 (key exchange) + HKDF-SHA256 (key
+  derivation) + AES-GCM (authenticated bulk encryption) — see §8.
 
 Do not substitute these without updating this file and justifying the change.
 
@@ -76,10 +86,11 @@ def canonical(obj: dict) -> bytes:
 There is a second, harder canonicalization problem specific to this domain:
 the **sequence identifier**. The same biological sequence can be written in
 multiple valid ways (case, line breaks, reverse complement, flanking regions,
-modified bases). The sequence must be canonicalized *before* it is committed
-to, or two identical syntheses will produce different commitments and the log
-becomes gameable. The sequence-canonicalization rule is an OPEN QUESTION
-(see §10) and is not yet fully specified.
+modified bases). The sequence must be canonicalized *before* it is encrypted,
+or two identical syntheses will produce unrelated ciphertext with no way to
+recognize they represent the same underlying sequence later. The
+sequence-canonicalization rule is an OPEN QUESTION (see §10) and is not yet
+fully specified.
 
 ---
 
@@ -87,23 +98,23 @@ becomes gameable. The sequence-canonicalization rule is an OPEN QUESTION
 
 Each entry is a dict with exactly these fields:
 
-| field       | meaning                                                        |
-|-------------|-----------------------------------------------------------------|
-| `index`     | monotonic counter, starts at 0                                 |
-| `timestamp` | ISO 8601 UTC, e.g. "2026-07-13T14:22:01Z"                      |
-| `seq_commit`| commitment to the synthesized sequence (see §8)                |
-| `metadata`  | forensically relevant synthesis params (length, etc.)          |
-| `leaf_hash` | this entry's hash as a Merkle tree leaf — see §6               |
+| field           | meaning                                                    |
+|-----------------|--------------------------------------------------------------|
+| `index`         | monotonic counter, starts at 0                              |
+| `timestamp`     | ISO 8601 UTC, e.g. "2026-07-13T14:22:01Z"                   |
+| `seq_ciphertext`| the synthesized sequence, encrypted to the auditor's public key (see §8) |
+| `metadata`      | forensically relevant synthesis params (length, etc.)       |
+| `leaf_hash`     | this entry's hash as a Merkle tree leaf — see §6             |
 
-An individual entry is **not signed on its own**. Chaining/commitment no
-longer lives in the entry itself (there is no `prev_hash`); it comes from
-the entry's position as a leaf in a Merkle tree instead (§6), and it is the
+An individual entry is **not signed on its own**. Chaining/commitment does
+not live in the entry itself (there is no `prev_hash`); it comes from the
+entry's position as a leaf in a Merkle tree instead (§6), and it is the
 tree's *root* that gets signed, once per append, as part of a checkpoint
 (§7) — not each entry individually.
 
-This is a change from the original hash-chain design (`prev_hash` +
-per-entry `entry_hash` + per-entry `signature`). See §10 item 1 for why, and
-§6/§7 for the replacement structure.
+Earlier versions of this design stored `seq_commit` (a hash-based
+commitment to the sequence) instead of `seq_ciphertext`. That field is
+retired, not kept alongside encryption — see §8 for why.
 
 ---
 
@@ -134,8 +145,13 @@ correctly.
 A leaf's hash is computed as:
 
 ```
-leaf_hash = hash_leaf(canonical({index, timestamp, seq_commit, metadata}))
+leaf_hash = hash_leaf(canonical({index, timestamp, seq_ciphertext, metadata}))
 ```
+
+`seq_ciphertext` feeds into this exactly like every other field — routine
+tamper-checking never needs to decrypt anything to catch tampering with it;
+it just re-hashes whatever ciphertext bytes are already stored, same as any
+other field.
 
 ### Root construction
 
@@ -171,10 +187,7 @@ other leaf) and consistency proofs (prove an older, smaller tree is a
 genuine append-only prefix of a newer, larger tree, without re-walking
 every entry). These exist and are tested, but **are not yet wired into
 `verify.py`'s actual audit flow** — see §10 item 1 and §12's footnote for
-the current, simpler check `verify.py` actually performs. They're the
-mechanism a future selective-disclosure workflow (e.g. "prove this one
-synthesis event was logged, to this one regulator, without showing them
-the rest of the log") would be built on.
+the current, simpler check `verify.py` actually performs.
 
 ---
 
@@ -209,26 +222,71 @@ the root hash.
 
 ---
 
-## 8. Sequence commitment
+## 8. Sequence confidentiality
+
+The raw sequence is **never persisted anywhere** — not in `synthlog.jsonl`,
+not in any other file this project writes. It exists only transiently, in
+memory, for the duration of one `logentry.build_entry` call, long enough to
+derive `seq_ciphertext` — nothing assigns it anywhere that gets written to
+disk.
+
+`seq_ciphertext` is a hybrid encryption of the sequence to a **second,
+separate keypair** from the device's Ed25519 signing key — X25519, held by
+the **auditor**, not the device:
 
 ```
-seq_commit = SHA256(canonical_sequence)     # current baseline
+seq_ciphertext = ephemeral_public_key || nonce || AESGCM_encrypt(
+    key = HKDF(X25519_exchange(ephemeral_private_key, auditor_public_key)),
+    plaintext = canonical_sequence,
+)
 ```
 
-Stores a commitment, not the sequence. This protects IP (the sequence is the
-core IP of a biotech customer) and keeps storage small, while remaining
-forensically useful: a regulator who later obtains a candidate sequence can
-hash it and check whether this device produced it.
+A fresh ephemeral X25519 keypair is generated on every single call — this
+is what makes the encryption non-deterministic (semantically secure):
+encrypting the identical sequence twice produces completely different
+ciphertext both times. This is load-bearing: the auditor's public key is
+provisioned to the device and is not secret (see §2's adversary
+capabilities), so if encryption were deterministic, anyone holding it could
+brute-force guess candidate sequences by re-encrypting them and comparing
+ciphertext — exactly the attack a salted hash commitment would need to
+defend against, except here it's defeated for free by the construction,
+rather than needing a manually-managed secret nonce.
 
-**KNOWN WEAKNESS (open):** a plain unsalted hash is *binding but not hiding*
-over a small input space. DNA is a 4-letter alphabet; short sequences can be
-brute-forced. An adversary can hash candidate sequences and match against the
-log to learn what was synthesized.
+**Key asymmetry, important to get right:** the device never generates or
+holds this keypair. The auditor generates it, on their own system; only the
+public half is ever provisioned to the device (out-of-band, analogous to
+how the auditor already receives the device's public *signing* key
+out-of-band for `verify.py`). The device can encrypt; it can never decrypt
+anything it has logged. Full detail in `sequence_crypto.py`.
 
-Candidate fix: salted commitment `SHA256(nonce || canonical_sequence)` with
-the nonce stored alongside. But then whoever holds the nonce can open the
-commitment — and the operator is the adversary. Who holds the nonce is an
-OPEN QUESTION (see §10). Baseline for now is unsalted; this must be revisited.
+The auditor decrypts `seq_ciphertext` for every sequence-level need
+uniformly — candidate confirmation, partial-sequence forensic matching, and
+function screening alike — since all three require the real plaintext, and
+no hash-based shortcut can ever provide that.
+
+### History: `seq_commit`, retired
+
+An earlier version of this design stored `seq_commit = SHA256(canonical_sequence)`
+— a one-way commitment, not a decryptable ciphertext — specifically so a
+party *without* decrypt access could check a known candidate sequence
+against the log. That capability doesn't have a remaining beneficiary in
+this design: the auditor always holds the decryption key, so every
+legitimate use of sequence content already goes through decryption. Keeping
+`seq_commit` alongside `seq_ciphertext` would have been redundant field
+duplication with no one left to serve. Retiring it also retires the
+salt/nonce-custody question that used to be open here (see §10) — there's
+no hash commitment left to brute-force, so nothing needs salting.
+
+### Open risk, stated plainly
+
+**Auditor private-key loss is catastrophic and irreversible for historical
+data.** There is deliberately no second copy of any sequence's plaintext,
+and no escrow path. If the auditor's private key is lost, every previously
+logged sequence becomes permanently unrecoverable — the tamper-evidence
+guarantees (§6/§7) are unaffected (the log still proves *something* was
+recorded and hasn't been altered), but the actual sequence content is gone
+for good. This is a real operational risk worth planning key-management
+practices around, not a defect to quietly work around later.
 
 ---
 
@@ -272,39 +330,53 @@ on this.
    the inclusion/consistency proof machinery that already exists in
    `merkletree.py` but isn't yet wired into `verify.py`'s audit flow.
 
-2. **Salted vs unsalted sequence commitment**, and if salted, who holds the
-   nonce given that the operator is the adversary (see §8).
+2. **Sequence canonicalization rule** — the biological identifier problem
+   (see §4). Needs input on what an investigator actually wants recorded,
+   and now also determines exactly what bytes get encrypted (§8), not just
+   what used to get hashed.
 
-3. **Sequence canonicalization rule** — the biological identifier problem
-   (see §4). Needs input on what an investigator actually wants recorded.
+3. **Which metadata fields are forensically meaningful** vs noise.
 
-4. **Which metadata fields are forensically meaningful** vs noise.
+4. **Auditor key management and recovery** (see §8's "open risk"). No
+   backup or escrow path currently exists for the auditor's private key;
+   losing it permanently forfeits every historical sequence's plaintext.
+   Whether that's acceptable, or whether some form of key backup/escrow is
+   needed (and who would hold it, given the same "who do you trust"
+   tension salting used to raise), is unresolved.
+
+(Formerly item 2 here: salted vs. unsalted `seq_commit`. Retired along with
+`seq_commit` itself — see §8 — there is no longer a hash commitment to
+salt.)
 
 ---
 
 ## 11. File plan
 
-| file           | responsibility                                                  | who writes it |
-|----------------|-------------------------------------------------------------------|---------------|
-| `canonical.py` | dict → deterministic bytes (§4)                                 | **by hand**   |
-| `merkletree.py`| Merkle tree construction, root computation, inclusion/consistency proofs (§6) | **by hand**   |
-| `logentry.py`  | build a leaf's hash, sign a checkpoint's root; the crypto core (§5, §7) | **by hand**   |
-| `log.py`       | append-only log + checkpoints; full tree rebuild per append      | agent OK      |
-| `verify.py`    | auditor's tool; walk log, check root integrity + checkpoint signature | agent OK*   |
-| `attack.py`    | corrupt a log/checkpoint file, run verify, report results table  | agent OK      |
+| file               | responsibility                                                | who writes it |
+|--------------------|------------------------------------------------------------------|---------------|
+| `canonical.py`     | dict → deterministic bytes (§4)                                | **by hand**   |
+| `merkletree.py`    | Merkle tree construction, root computation, inclusion/consistency proofs (§6) | **by hand**   |
+| `sequence_crypto.py` | auditor keypair + hybrid encrypt/decrypt of sequences (§8)   | **by hand**   |
+| `logentry.py`      | build a leaf's hash, encrypt a sequence, sign a checkpoint's root; the crypto core (§5, §7, §8) | **by hand** |
+| `log.py`           | append-only log + checkpoints; full tree rebuild per append      | agent OK      |
+| `verify.py`        | auditor's tool; walk log, check root integrity + checkpoint signature | agent OK*  |
+| `attack.py`        | corrupt a log/checkpoint file, run verify, report results table  | agent OK      |
 
 \* `verify.py` must check **both**: (1) recomputing the tree from every
 entry matches the last checkpoint's `root_hash` and `tree_size`, (2) that
 checkpoint's signature is valid. A verifier that silently skips one is
-worse than none. Read every line before trusting it.
+worse than none. Read every line before trusting it. Note `verify.py`
+never decrypts anything — routine verification only ever re-hashes
+`seq_ciphertext`, the same as any other field.
 
-Hand-written files (`canonical.py`, `merkletree.py`, `logentry.py`) are OFF
-LIMITS to the coding agent. State this in every agent prompt.
-`merkletree.py` earns this status for the same reason the other two do: a
-subtle bug in tree/proof construction (e.g. missing domain separation, or
-an unsound consistency-proof check — both mistakes actually made and
-caught during this file's development) can silently defeat the whole
-security property.
+Hand-written files (`canonical.py`, `merkletree.py`, `sequence_crypto.py`,
+`logentry.py`) are OFF LIMITS to the coding agent. State this in every
+agent prompt. `merkletree.py` and `sequence_crypto.py` earn this status for
+the same reason `canonical.py`/`logentry.py` do: subtle bugs in tree/proof
+construction or in the encryption assembly (missing domain separation, an
+unsound consistency-proof check, reused nonces/keys — all real classes of
+mistake, some actually made and caught during this project's development)
+can silently defeat the whole security property.
 
 ---
 
@@ -320,18 +392,28 @@ security property.
 ## 13. Acceptance demo
 
 ```
-append 3 entries             -> verify: OK
-delete entry 1                -> verify: tree size mismatch
-modify entry 1 metadata       -> verify: root mismatch
-modify + forge checkpoint     -> verify: signature invalid   <- the payoff
+append 3 entries               -> verify: OK
+delete entry 1                 -> verify: tree size mismatch
+modify entry 1 metadata        -> verify: root mismatch
+swap entry 1 ciphertext        -> verify: root mismatch
+modify + forge checkpoint      -> verify: signature invalid   <- the payoff
 ```
 
 Note the shape of this changed from the original hash-chain version: delete
 and modify used to be caught by two *different* checks (chain linkage vs.
 hash integrity), so they had distinguishable error messages. In a Merkle
-tree, any change to any entry changes the root, so both are now caught by
-the *same* check — a deliberate tradeoff (§10 item 1, losing per-entry
-localization in the report) in exchange for the tree's other properties.
+tree, any change to any entry changes the root, so all of delete/modify/
+ciphertext-swap are now caught by the *same* check — a deliberate tradeoff
+(§10 item 1, losing per-entry localization in the report) in exchange for
+the tree's other properties.
+
+The fourth row (swap entry 1 ciphertext) exists specifically to
+demonstrate that `seq_ciphertext` being opaque doesn't make it a blind
+spot: the operator has the auditor's public key (§8) and can produce
+perfectly *valid* ciphertext, just not ciphertext that reproduces the
+original `leaf_hash` without knowing what was actually encrypted inside
+it. Caught the same way a metadata edit is.
+
 The last line is still the core argument: the operator can recompute a
 tampered tree's root correctly, but cannot forge the checkpoint's signature
 over it, so cannot silently rewrite history.
@@ -347,11 +429,17 @@ over it, so cannot silently rewrite history.
    inputs (negative cases) before moving to the next — the consistency
    proof implementation passed every positive test while still being
    unsound, twice, until adversarial testing caught it.
-3. `logentry.py` — build one entry and one checkpoint, print them, eyeball
+3. `sequence_crypto.py` — hybrid encrypt/decrypt, tested standalone
+   (round-trip correctness; confirm two encryptions of the same sequence
+   produce different ciphertext; confirm tampering and wrong-key
+   decryption both fail loudly) before anything else depends on it.
+4. `logentry.py` — build one entry and one checkpoint, print them, eyeball
    the fields.
-4. `log.py` — append 3 entries, look at both JSONL files by hand.
-5. `verify.py` — run on the clean log, confirm it says OK.
-6. `attack.py` — delete/modify an entry, watch verify break; then forge a
-   checkpoint over the tampered tree and watch the signature check catch
-   it — the "unsigned rewrite succeeds until the signature layer" moment
-   that motivates the whole signing scheme.
+5. `log.py` — append 3 entries, look at both JSONL files by hand; confirm
+   no plaintext sequence appears anywhere in either file.
+6. `verify.py` — run on the clean log, confirm it says OK.
+7. `attack.py` — delete/modify/swap-ciphertext an entry, watch verify
+   break each way; then forge a checkpoint over the tampered tree and
+   watch the signature check catch it — the "unsigned rewrite succeeds
+   until the signature layer" moment that motivates the whole signing
+   scheme.

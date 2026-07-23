@@ -96,7 +96,7 @@ def check_root_integrity(entries: list[dict], checkpoint: dict) -> None:
         compute_leaf_hash(
             index=entry["index"],
             timestamp=entry["timestamp"],
-            seq_commit=entry["seq_commit"],
+            seq_ciphertext=entry["seq_ciphertext"],
             metadata=entry["metadata"],
         )
         for entry in entries
@@ -183,6 +183,8 @@ def verify_log(
         return f"TAMPER: {e}"
     return f"OK, {len(entries)} entries, root matches signed checkpoint"
 
+
+#following runs as a standalone command line tool.
 
 if __name__ == "__main__":
     from logentry import load_public_key
