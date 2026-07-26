@@ -40,8 +40,10 @@ files. This is not a stylistic preference:
   looking correct on every "does it work" test.
 - **`log.py`, `verify.py`, `attack.py` are agent-OK.**
 
-`canonical_sequence()` (in `canonical.py`) remains deliberately
-unimplemented — an open design question (see below), not a bug.
+`canonical_sequence()` (in `canonical.py`) is now implemented: uppercase,
+strip whitespace, validate against the IUPAC nucleotide alphabet, keep
+ambiguity/degenerate codes as-is, do not collapse reverse complement. See
+`design.md` §10 item 2.
 
 ## Commands
 
@@ -96,8 +98,9 @@ encryption, and signing — each owned by exactly one file:
   `json.dumps()` call anywhere else would let write-time and verify-time
   bytes drift apart for reasons unrelated to tampering, silently breaking
   every hash check. `canonical_sequence()` (sequence normalization before
-  it's encrypted) is an intentionally unimplemented open design question —
-  see `design.md` §4/§10.2.
+  it's encrypted) is now resolved: uppercase, strip whitespace, validate
+  against the IUPAC nucleotide alphabet, keep ambiguity codes as-is, don't
+  collapse reverse complement — see `design.md` §4/§10.2.
 
 - **`merkletree.py`** — Merkle tree construction (RFC 6962-style). Two
   domain-separated hash functions, `hash_leaf(data) = SHA256(0x00||data)`
@@ -215,9 +218,12 @@ something that looks incomplete:
    the log grows large enough that full-rebuild-per-append becomes costly,
    and when/whether to start actually using the inclusion/consistency proof
    machinery already built in `merkletree.py`.
-2. `canonical_sequence()` — not yet specified (see above); now also
-   determines exactly what bytes get encrypted, not just what used to get
-   hashed into the retired `seq_commit`.
+2. Sequence canonicalization — **resolved** (see above): uppercase, strip
+   whitespace, validate against the IUPAC nucleotide alphabet, keep
+   ambiguity codes as-is, don't collapse reverse complement. Still open:
+   this only partially closes the "resubmit in a cosmetically different
+   form" laundering concern — it doesn't address the reverse-complement
+   case, which would need a separate cross-check elsewhere if wanted.
 3. Which metadata fields are actually forensically meaningful.
 4. Auditor key management/recovery — there is deliberately no backup or
    escrow path for the auditor's private decryption key; losing it

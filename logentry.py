@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-from canonical import canonical
+from canonical import canonical, canonical_sequence
 import os
 from merkletree import hash_leaf
 
@@ -206,6 +206,15 @@ def build_entry(
     auditor_public_key instead of a pre-made seq_commit, and actually
     performs the encryption here via sequence_crypto.encrypt_sequence.
 
+    raw_sequence is canonicalized (canonical.canonical_sequence) before
+    encryption, per design.md §4 — canonicalizing after encryption would be
+    impossible (ciphertext isn't a sequence string) and canonicalizing only
+    at read time wouldn't help, since two differently-spelled but
+    identical sequences would already have encrypted to unrelated
+    ciphertext. This is also the point where a malformed raw_sequence
+    (invalid IUPAC symbol, empty string) raises and aborts the append,
+    before anything is encrypted or written.
+
     raw_sequence exists only for the duration of this call — it gets
     consumed into seq_ciphertext below and never assigned anywhere else,
     never written to disk in its own right. This is the first (and only)
@@ -216,7 +225,8 @@ def build_entry(
     here for storage — same inspectability convention as leaf_hash and
     signature elsewhere in this file.
     """
-    seq_ciphertext = encrypt_sequence(raw_sequence, auditor_public_key).hex()
+    sequence = canonical_sequence(raw_sequence)
+    seq_ciphertext = encrypt_sequence(sequence, auditor_public_key).hex()
 
     leaf_hash = compute_leaf_hash(
         index=index,

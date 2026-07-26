@@ -85,12 +85,13 @@ def canonical(obj: dict) -> bytes:
 
 There is a second, harder canonicalization problem specific to this domain:
 the **sequence identifier**. The same biological sequence can be written in
-multiple valid ways (case, line breaks, reverse complement, flanking regions,
-modified bases). The sequence must be canonicalized *before* it is encrypted,
-or two identical syntheses will produce unrelated ciphertext with no way to
-recognize they represent the same underlying sequence later. The
-sequence-canonicalization rule is an OPEN QUESTION (see §10) and is not yet
-fully specified.
+multiple valid ways (case, line breaks, flanking regions). The sequence must
+be canonicalized *before* it is encrypted, or two identical syntheses will
+produce unrelated ciphertext with no way to recognize they represent the same
+underlying sequence later. Resolved per §10 item 2: uppercase, strip
+whitespace, validate against the IUPAC nucleotide alphabet, keep ambiguity
+codes as-is, do not collapse reverse complement — see `canonical.py`'s
+`canonical_sequence`.
 
 ---
 
@@ -330,10 +331,21 @@ on this.
    the inclusion/consistency proof machinery that already exists in
    `merkletree.py` but isn't yet wired into `verify.py`'s audit flow.
 
-2. **Sequence canonicalization rule** — the biological identifier problem
-   (see §4). Needs input on what an investigator actually wants recorded,
-   and now also determines exactly what bytes get encrypted (§8), not just
-   what used to get hashed.
+2. **Sequence canonicalization rule — RESOLVED.** Case-fold to uppercase,
+   strip all whitespace/newlines, validate against the 16-symbol IUPAC
+   nucleotide alphabet (reject anything else). Ambiguity/degenerate codes
+   (`N`, `K`, an `NNK` codon, etc.) are kept as-is rather than expanded or
+   rejected — they're a legitimate, common synthesis order (mixed-base
+   oligo pools for library construction), not sequencing uncertainty;
+   realizing the actual randomness happens downstream of this log, which
+   only commits to the order spec as submitted. Reverse complement is
+   *not* collapsed — two RC-equivalent sequences canonicalize to two
+   different strings, since RC is a biologically meaningful difference in
+   what was submitted, not a cosmetic one like case/whitespace. **Still
+   open:** this leaves the "resubmit in a cosmetically different form"
+   laundering concern from §4 only partially closed for the RC case — a
+   dedicated RC cross-check, if wanted, would live elsewhere, not in this
+   function. See `canonical.py`'s `canonical_sequence`.
 
 3. **Which metadata fields are forensically meaningful** vs noise.
 

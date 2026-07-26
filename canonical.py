@@ -55,43 +55,55 @@ def canonical(obj: dict) -> bytes:
     ).encode("utf-8")
 
 
+_IUPAC_NUCLEOTIDE_CODES = frozenset("ACGTRYSWKMBDHVN")
+
+
 def canonical_sequence(raw_sequence: str) -> str:
     """
-    Canonicalize a raw DNA sequence string BEFORE it is hashed into a
-    seq_commit (design.md §6). This is the OPEN QUESTION from §4 / §8.3
-    — it is not yet specified, and it is deliberately left unimplemented
-    here rather than guessed at by an agent.
+    Canonicalize a raw DNA sequence string BEFORE it is encrypted into
+    seq_ciphertext (design.md §4/§8). Resolved per design.md §10 item 2:
 
-    The problem: the same biological sequence can be written many
-    different valid ways —
-      - upper vs lower case
-      - line breaks / whitespace from whatever export tool produced it
-      - the reverse complement of the same physical strand
-      - flanking vector/adapter sequence included or trimmed
-      - ambiguity codes or modified-base notation (methylated C, etc.)
+      1. Case folding: uppercase everything.
+      2. Whitespace/newline stripping: removed entirely — FASTA-style
+         line wrapping, trailing newlines, etc. are export formatting,
+         not content.
+      3. Alphabet validation: every remaining character must be a valid
+         IUPAC nucleotide code (A C G T R Y S W K M B D H V N). Anything
+         else raises, rather than being silently dropped or normalized
+         away — this is a synthesis order, not a sequencing read, so a
+         stray non-IUPAC character is an input error to surface, not
+         noise to clean up.
+      4. Ambiguity codes are KEPT as-is, not expanded or rejected.
+         Degenerate codes (a single N/K, or a whole NNK codon) are a
+         common, legitimate synthesis order — mixed-base oligo pools for
+         library construction — not sequencing uncertainty to strip out.
+         Realizing the actual randomness (which base ends up in which
+         physical molecule of the pool) happens downstream in the
+         synthesis pipeline; this log only commits to the order
+         specification as submitted, not to molecular ground truth.
+      5. Reverse complement is NOT collapsed. Two sequences that are
+         each other's reverse complement canonicalize to two different
+         strings. This is a domain judgment call, not a technical
+         default: unlike case/whitespace, RC is a biologically
+         meaningful difference in what was submitted, and collapsing it
+         would throw away information an investigator may need. Net
+         effect: this function does not fully close the "resubmit in a
+         cosmetically different form" laundering concern for the RC
+         case specifically — closing that would require a separate
+         cross-check elsewhere, not a lossy rule baked in here.
 
-    If this function doesn't normalize all of that, two runs that
-    physically synthesized the identical sequence produce two different
-    seq_commit values in the log — which means the log UNDER-counts
-    tampering it should be catching: an operator could "launder" a
-    flagged synthesis by resubmitting it in a cosmetically different
-    text form and have it read as an unrelated, first-time event.
-
-    TODO (you): decide and implement the actual rule. At minimum decide:
-      1. Case folding — almost certainly: uppercase everything.
-      2. Whitespace/newline stripping.
-      3. Reverse-complement equivalence — does an investigator care
-         which strand was physically synthesized, or only which molecule
-         resulted? If they don't care, RC-equivalent sequences should
-         canonicalize to the same string; if they do, they must not.
-         This is a domain judgment call, not a coding one.
-      4. Non-ACGT characters — reject/flag them rather than silently
-         normalizing, so ambiguity doesn't get laundered into a
-         canonical form that hides it.
-
-    Until this is implemented, seq_commit is not a trustworthy
-    commitment — do not treat it as one in verify.py or the write-up.
+    Raises ValueError on an empty sequence or any non-IUPAC character.
     """
-    raise NotImplementedError(
-        "canonical_sequence is an open design question — see design.md §4, §8.3"
-    )
+    sequence = "".join(raw_sequence.split()).upper()
+
+    if not sequence:
+        raise ValueError("canonical_sequence: empty sequence")
+
+    invalid = sorted(set(sequence) - _IUPAC_NUCLEOTIDE_CODES)
+    if invalid:
+        raise ValueError(
+            f"canonical_sequence: invalid symbol(s) {invalid} — "
+            "not valid IUPAC nucleotide codes"
+        )
+
+    return sequence
