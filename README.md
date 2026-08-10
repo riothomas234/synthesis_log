@@ -1,4 +1,6 @@
-# Tamper-Evident Local Synthesis Log
+# Tamper-Evident Local Synthesis Log 
+
+(claude generated document)
 
 Records DNA synthesis events into an append-only log such that any later
 deletion, modification, reordering, or forgery of entries is **detectable**
