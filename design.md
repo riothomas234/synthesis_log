@@ -238,7 +238,7 @@ the **auditor**, not the device:
 ```
 seq_ciphertext = ephemeral_public_key || nonce || AESGCM_encrypt(
     key = HKDF(X25519_exchange(ephemeral_private_key, auditor_public_key)),
-    plaintext = canonical_sequence,
+    plaintext = canonical_sequence(raw_sequence),
 )
 ```
 
