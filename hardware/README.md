@@ -1,72 +1,111 @@
-# Raspberry Pi 3 B+ to MSI MS-4462 TPM
+# TPM prototype
 
-This is the bench wiring for the 12-1-pin SPI MS-4462 module marked
-`VER:1.03`. All logic and power are 3.3 V.
+The optional hardware mode uses a TPM 2.0 SHA-256 NV extend index. It is not
+tied to a Raspberry Pi or a particular TPM module. The prototype invokes
+`tpm2-tools` directly and has been exercised with a discrete Nuvoton NPCT75x.
 
-## Module connector orientation
+Hardware mode adds rollback and fork evidence to the existing Merkle tree. It
+does not replace the tree: the tree commits to every log entry, while the TPM
+accumulator prevents an operator from presenting an earlier signed tree state
+as current during a live audit.
 
-Hold the module component-side up with `MSI` readable and look directly into
-the connector. The blocked hole is second from the left in the top row:
+## Mutable test setup
 
-```text
-                 MS-4462 socket, mating face
+Use a disposable owner-created index while testing. This index is deliberately
+deletable and therefore does not provide a root-resistant production
+guarantee.
 
-              left                         right
-top row       [12 IRQ] [10 KEY] [8 RST#] [6 CLK] [4 MOSI] [2 CS#]
-bottom row    [11 NC ] [ 9 NC ] [7 GND ] [5 NC ] [3 MISO] [1 3V3]
-                         ^ blocked hole
+```sh
+sudo tpm2_nvdefine 0x01534c47 -C o -s 32 -g sha256 \
+  -a 'ownerwrite|authwrite|ownerread|authread|nt=extend|no_da'
 ```
 
-Pins 5, 9, and 11 are reserved. Leave them disconnected. Pin 12 is the
-optional interrupt and can also remain disconnected for initial polling-mode
-operation.
+Create or load a restricted ECC signing key and retain its public key, Name,
+qualified Name, and attributes as auditor provisioning material. Enrollment
+rejects an unrestricted signing key because root could use one as an oracle to
+sign fabricated attestation bytes. The `--ak-context` argument may be a context
+file for a bench session or a persistent TPM handle for a durable deployment.
+Enroll only against a fresh pair of log and checkpoint files: the observed NV
+value becomes `A_0` for that log.
 
-## Circuit
-
-```text
-Raspberry Pi 3 B+                         MSI MS-4462
-
-physical 1   3V3  ----------------------- pin 1  SPI power
-physical 24  CE0  ----------------------- pin 2  CS#
-physical 21  MISO <----------------------- pin 3  MISO
-physical 19  MOSI -----------------------> pin 4  MOSI
-physical 23  SCLK -----------------------> pin 6  SPI clock
-physical 6   GND  ------------------------ pin 7  ground
-
-                         3V3
-                          |
-                        10 kohm
-                          |
-                          +---------------- pin 8  RST#
-                          |
-                        1 uF temporary
-                          |
-                         GND
-
-pin 5  reserved -------------------------- no connection
-pin 9  reserved -------------------------- no connection
-pin 10 key ------------------------------- blocked
-pin 11 reserved -------------------------- no connection
-pin 12 IRQ# ------------------------------ no connection initially
+```sh
+python3 tpm_guard.py enroll \
+  --config tpm-guard.json \
+  --index 0x01534c47 \
+  --ak-context signing.ctx \
+  --ak-public-key signing.pem \
+  --sudo
 ```
 
-The temporary 1 uF reset capacitor with the 10 kohm pull-up gives an RC time
-constant of about 10 ms. Replace it with a 100 nF (`0.1 uF`, marking `104`)
-capacitor when available. If the 1 uF capacitor is polarized, connect its
-positive lead to RST# and negative lead to GND.
+Pass the enrolled guard explicitly when appending:
 
-The module has local surface-mount capacitors. An optional 1 uF ceramic can be
-placed directly between pins 1 and 7 for extra breadboard supply bypassing. Do
-not use a 100 uF capacitor on RST#.
+```python
+from tpm_guard import TPMGuard
 
-## Before applying power
+guard = TPMGuard("tpm-guard.json")
+append_entry(..., rollback_guard=guard)
+```
 
-1. Disconnect power from the Pi.
-2. Use continuity mode to confirm pin 7 reaches the ground side of the
-   module's local capacitors.
-3. Confirm there is no short between module pins 1 and 7.
-4. Recheck that the blocked socket position is pin 10 and that no connections
-   are mirrored.
-5. Keep the SPI wires short, preferably under 15 cm for the first test.
-6. Apply 3.3 V only. Never connect this module to a Pi 5 V pin.
+If no guard is passed, behavior and file formats are unchanged. Once a guard is
+passed, an unavailable or mismatched TPM aborts the append; there is no silent
+software fallback.
 
+## Crash recovery
+
+The guarded append holds a process lock and performs these operations:
+
+1. Verify that replaying every checkpoint from `A_0` equals the live NV value.
+2. Durably write a pending journal containing both exact JSONL records.
+3. Extend the checkpoint commitment into the TPM.
+4. Read the NV value back and compare it with the expected extension result.
+5. Durably append the entry and checkpoint, then remove the journal.
+
+On restart, the pending journal distinguishes the two recoverable states. If
+the TPM still contains the recorded prior value, recovery performs the extend.
+If it contains the recorded result, recovery writes any missing or partial
+JSONL record without extending again. Any other value or unexpected file
+content fails closed.
+
+## Live audit
+
+The auditor generates a fresh random 32-byte nonce. On the device:
+
+```sh
+python3 tpm_audit.py \
+  --config tpm-guard.json \
+  --checkpoints checkpoints.jsonl \
+  --signing-context signing.ctx \
+  --nonce "$NONCE_HEX" \
+  --output attestation.json
+```
+
+The auditor retains the enrollment JSON and AK public key independently, then
+verifies the returned bundle:
+
+```sh
+python3 tpm_verify.py \
+  --provisioning tpm-guard.json \
+  --checkpoints checkpoints.jsonl \
+  --bundle attestation.json \
+  --nonce "$NONCE_HEX" \
+  --ak-public-key signing.pem
+```
+
+Verification checks the ECDSA signature, fresh nonce, attestation type, AK
+Name, NV Name, offset, checkpoint count, and the accumulator recomputed from
+the complete checkpoint history. Run `verify.py` as well: TPM verification
+does not replace Merkle-root and device-checkpoint signature verification.
+
+## Immutable deployment
+
+After the mutable workflow passes, replace the disposable index with a
+platform-created `policydelete` extend index. Its deletion branch must require
+an offline auditor authorization and `TPM2_CC_NV_UndefineSpaceSpecial`.
+Neither platform authorization nor an auditor deletion private key belongs on
+the device. Test that policy using a deletable auditor-controlled policy before
+creating an intentionally undeletable index.
+
+Root can still stop logging, extend garbage, destroy the TPM, or replace the
+machine. Those actions cause denial of service or detectable reprovisioning;
+this mechanism cannot prove that logging software observed every physical
+synthesis event.

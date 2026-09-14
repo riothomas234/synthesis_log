@@ -1,0 +1,179 @@
+"""Auditor-side verification of a TPM NV certification."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import (
+    decode_dss_signature,
+    encode_dss_signature,
+)
+
+from log import read_checkpoints
+from tpm_guard import TPMGuardError, replay_accumulator
+
+
+TPM_GENERATED_VALUE = 0xFF544347
+TPM_ST_ATTEST_NV = 0x8014
+TPM_ALG_ECDSA = 0x0018
+TPM_ALG_SHA256 = 0x000B
+
+
+class AttestationError(TPMGuardError):
+    pass
+
+
+class _Reader:
+    def __init__(self, value: bytes):
+        self.value = value
+        self.offset = 0
+
+    def take(self, size: int) -> bytes:
+        end = self.offset + size
+        if end > len(self.value):
+            raise AttestationError("truncated TPMS_ATTEST")
+        result = self.value[self.offset:end]
+        self.offset = end
+        return result
+
+    def number(self, size: int) -> int:
+        return int.from_bytes(self.take(size), "big")
+
+    def tpm2b(self) -> bytes:
+        return self.take(self.number(2))
+
+
+def parse_nv_attestation(value: bytes) -> dict:
+    reader = _Reader(value)
+    result = {
+        "magic": reader.number(4),
+        "type": reader.number(2),
+        "qualified_signer": reader.tpm2b(),
+        "extra_data": reader.tpm2b(),
+        "clock": reader.number(8),
+        "reset_count": reader.number(4),
+        "restart_count": reader.number(4),
+        "safe": reader.number(1),
+        "firmware_version": reader.number(8),
+        "index_name": reader.tpm2b(),
+        "offset": reader.number(2),
+        "nv_contents": reader.tpm2b(),
+    }
+    if reader.offset != len(value):
+        raise AttestationError(
+            f"TPMS_ATTEST has {len(value) - reader.offset} trailing bytes"
+        )
+    return result
+
+
+def parse_ecdsa_signature(value: bytes) -> bytes:
+    if value.startswith(b"\x30"):
+        try:
+            r, s = decode_dss_signature(value)
+        except ValueError as exc:
+            raise AttestationError("invalid DER ECDSA signature") from exc
+        return encode_dss_signature(r, s)
+
+    reader = _Reader(value)
+    algorithm = reader.number(2)
+    hash_algorithm = reader.number(2)
+    r = reader.tpm2b()
+    s = reader.tpm2b()
+    if reader.offset != len(value):
+        raise AttestationError(
+            f"TPMT_SIGNATURE has {len(value) - reader.offset} trailing bytes"
+        )
+    if algorithm != TPM_ALG_ECDSA or hash_algorithm != TPM_ALG_SHA256:
+        raise AttestationError(
+            "TPM signature is not ECDSA with SHA-256: "
+            f"algorithm 0x{algorithm:04x}, hash 0x{hash_algorithm:04x}"
+        )
+    return encode_dss_signature(int.from_bytes(r, "big"), int.from_bytes(s, "big"))
+
+
+def verify_attestation(
+    checkpoints: list[dict],
+    provisioning: dict,
+    bundle: dict,
+    expected_nonce: bytes,
+    ak_public_key_pem: bytes,
+) -> bytes:
+    if bundle.get("version") != 1:
+        raise AttestationError("unsupported attestation bundle version")
+    if bytes.fromhex(bundle["nonce"]) != expected_nonce:
+        raise AttestationError("bundle nonce does not match the audit challenge")
+    if bundle["checkpoint_count"] != len(checkpoints):
+        raise AttestationError(
+            "bundle checkpoint count does not match the presented history"
+        )
+
+    attestation_bytes = bytes.fromhex(bundle["attestation"])
+    signature = parse_ecdsa_signature(bytes.fromhex(bundle["signature"]))
+    public_key = serialization.load_pem_public_key(ak_public_key_pem)
+    if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        raise AttestationError("prototype supports an ECC attestation key only")
+    try:
+        public_key.verify(signature, attestation_bytes, ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature as exc:
+        raise AttestationError("TPM attestation signature is invalid") from exc
+
+    attested = parse_nv_attestation(attestation_bytes)
+    if attested["magic"] != TPM_GENERATED_VALUE:
+        raise AttestationError("attestation magic is not TPM_GENERATED_VALUE")
+    if attested["type"] != TPM_ST_ATTEST_NV:
+        raise AttestationError("attestation is not an NV certification")
+    if attested["extra_data"] != expected_nonce:
+        raise AttestationError("TPM qualifying data does not match the audit challenge")
+    if (
+        attested["qualified_signer"].hex()
+        != provisioning["ak_qualified_name"].lower()
+    ):
+        raise AttestationError(
+            "attestation key qualified Name does not match provisioning"
+        )
+    if attested["index_name"].hex() != provisioning["nv_name"].lower():
+        raise AttestationError("certified NV Name does not match provisioning")
+    if attested["offset"] != 0:
+        raise AttestationError(f"certified NV data starts at offset {attested['offset']}")
+
+    initial_value = bytes.fromhex(provisioning["initial_value"])
+    expected_accumulator = replay_accumulator(initial_value, checkpoints)
+    if bytes.fromhex(bundle["accumulator"]) != expected_accumulator:
+        raise AttestationError("bundle accumulator does not match checkpoint history")
+    if attested["nv_contents"] != expected_accumulator:
+        raise AttestationError("certified NV value does not match checkpoint history")
+    return expected_accumulator
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--provisioning", required=True)
+    parser.add_argument("--checkpoints", default="checkpoints.jsonl")
+    parser.add_argument("--bundle", required=True)
+    parser.add_argument("--nonce", required=True, help="expected 32-byte nonce in hex")
+    parser.add_argument("--ak-public-key", required=True)
+    args = parser.parse_args()
+
+    provisioning = json.loads(Path(args.provisioning).read_text(encoding="utf-8"))
+    bundle = json.loads(Path(args.bundle).read_text(encoding="utf-8"))
+    checkpoints = read_checkpoints(args.checkpoints)
+    accumulator = verify_attestation(
+        checkpoints,
+        provisioning,
+        bundle,
+        bytes.fromhex(args.nonce),
+        Path(args.ak_public_key).read_bytes(),
+    )
+    print(
+        f"OK, {len(checkpoints)} checkpoints, fresh TPM certification, "
+        f"accumulator {accumulator.hex()}"
+    )
+
+
+if __name__ == "__main__":
+    main()
