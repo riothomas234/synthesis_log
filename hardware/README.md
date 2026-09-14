@@ -79,22 +79,28 @@ python3 tpm_audit.py \
   --output attestation.json
 ```
 
-The auditor retains the enrollment JSON and AK public key independently, then
-verifies the returned bundle:
+The auditor retains the enrollment JSON, AK public key, and device public key
+independently, then verifies the returned bundle against the log:
 
 ```sh
 python3 tpm_verify.py \
   --provisioning tpm-guard.json \
+  --log synthlog.jsonl \
   --checkpoints checkpoints.jsonl \
   --bundle attestation.json \
   --nonce "$NONCE_HEX" \
-  --ak-public-key signing.pem
+  --ak-public-key signing.pem \
+  --device-public-key keys/device_public_key.pem
 ```
 
-Verification checks the ECDSA signature, fresh nonce, attestation type, AK
-Name, NV Name, offset, checkpoint count, and the accumulator recomputed from
-the complete checkpoint history. Run `verify.py` as well: TPM verification
-does not replace Merkle-root and device-checkpoint signature verification.
+Verification first runs `verify.py`'s checks (last checkpoint root and device
+signature), then checks the ECDSA signature, fresh nonce, attestation type, AK
+Name, NV Name, offset, checkpoint count, the accumulator recomputed from the
+complete checkpoint history, and that every checkpoint's root equals the root
+of the corresponding prefix of log entries. The prefix check is what ties the
+TPM-bound checkpoint history to the entries: without it, an operator with
+signing-oracle access could delete an extended entry, sign and extend one new
+checkpoint for the altered log, and still pass replay.
 
 ## Immutable deployment
 

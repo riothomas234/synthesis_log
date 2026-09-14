@@ -10,8 +10,15 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from log import append_entry, read_checkpoints, read_log
 from logentry import generate_keypair
 from sequence_crypto import generate_auditor_keypair
-from tpm_guard import TPMGuard, TPMGuardError, checkpoint_commitment, extend_value
+from tpm_guard import (
+    TPMGuard,
+    TPMGuardError,
+    checkpoint_commitment,
+    extend_value,
+    replay_accumulator,
+)
 from tpm_verify import AttestationError, parse_nv_attestation, verify_attestation
+from verify import verify_log
 
 
 class FakeTPM:
@@ -41,7 +48,7 @@ class TPMGuardTests(unittest.TestCase):
         self.log_path = root / "log.jsonl"
         self.checkpoints_path = root / "checkpoints.jsonl"
         self.config_path = root / "tpm.json"
-        self.private_key, _ = generate_keypair(
+        self.private_key, self.public_key = generate_keypair(
             str(root / "keys" / "device-private.pem"),
             str(root / "keys" / "device-public.pem"),
         )
@@ -142,8 +149,50 @@ class TPMGuardTests(unittest.TestCase):
 
     def test_nv_certification_is_bound_to_nonce_identity_and_history(self):
         self.append(self.guard())
+        entries = read_log(str(self.log_path))
         checkpoints = read_checkpoints(str(self.checkpoints_path))
         nonce = hashlib.sha256(b"auditor challenge").digest()
+        provisioning, bundle, public_pem = self.certify(nonce, len(checkpoints))
+        self.assertEqual(
+            verify_attestation(
+                entries, checkpoints, provisioning, bundle, nonce, public_pem
+            ),
+            self.backend.value,
+        )
+        with self.assertRaisesRegex(AttestationError, "bundle nonce"):
+            verify_attestation(
+                entries, checkpoints, provisioning, bundle, b"x" * 32, public_pem
+            )
+
+    def test_oracle_deletion_passes_replay_but_fails_prefix_check(self):
+        initial = self.backend.value
+        guard = self.guard()
+        for _ in range(3):
+            self.append(guard)
+        # Operator deletes entry 1 and duplicates entry 2 as filler, then uses
+        # the signing oracle for one new checkpoint and extends it.
+        lines = self.log_path.read_bytes().splitlines(keepends=True)
+        self.log_path.write_bytes(lines[0] + lines[2] + lines[2])
+        self.append(None)
+        checkpoints = read_checkpoints(str(self.checkpoints_path))
+        self.backend.extend(checkpoint_commitment(checkpoints[-1]))
+        entries = read_log(str(self.log_path))
+        assert len(entries) == len(checkpoints) == 4, (len(entries), len(checkpoints))
+
+        self.assertEqual(replay_accumulator(initial, checkpoints), self.backend.value)
+        self.assertTrue(
+            verify_log(
+                str(self.log_path), str(self.checkpoints_path), self.public_key
+            ).startswith("OK")
+        )
+        nonce = hashlib.sha256(b"auditor challenge").digest()
+        provisioning, bundle, public_pem = self.certify(nonce, len(checkpoints))
+        with self.assertRaisesRegex(AttestationError, "checkpoint 2 root"):
+            verify_attestation(
+                entries, checkpoints, provisioning, bundle, nonce, public_pem
+            )
+
+    def certify(self, nonce, checkpoint_count):
         ak_private = ec.generate_private_key(ec.SECP256R1())
         ak_name = bytes.fromhex("000b" + "22" * 32)
         attestation = _nv_attestation(
@@ -160,7 +209,7 @@ class TPMGuardTests(unittest.TestCase):
         bundle = {
             "version": 1,
             "nonce": nonce.hex(),
-            "checkpoint_count": 1,
+            "checkpoint_count": checkpoint_count,
             "accumulator": self.backend.value.hex(),
             "attestation": attestation.hex(),
             "signature": signature.hex(),
@@ -169,16 +218,7 @@ class TPMGuardTests(unittest.TestCase):
             serialization.Encoding.PEM,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         )
-        self.assertEqual(
-            verify_attestation(
-                checkpoints, provisioning, bundle, nonce, public_pem
-            ),
-            self.backend.value,
-        )
-        with self.assertRaisesRegex(AttestationError, "bundle nonce"):
-            verify_attestation(
-                checkpoints, provisioning, bundle, b"x" * 32, public_pem
-            )
+        return provisioning, bundle, public_pem
 
 
 def _tpm2b(value):

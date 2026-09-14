@@ -14,8 +14,11 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
     encode_dss_signature,
 )
 
-from log import read_checkpoints
+from log import read_checkpoints, read_log
+from logentry import compute_leaf_hash, load_public_key
+from merkletree import compute_root
 from tpm_guard import TPMGuardError, replay_accumulator
+from verify import verify_log
 
 
 TPM_GENERATED_VALUE = 0xFF544347
@@ -96,7 +99,38 @@ def parse_ecdsa_signature(value: bytes) -> bytes:
     return encode_dss_signature(int.from_bytes(r, "big"), int.from_bytes(s, "big"))
 
 
+def check_checkpoint_prefixes(entries: list[dict], checkpoints: list[dict]) -> None:
+    """Every checkpoint's root must equal the root of the matching entry prefix.
+
+    Replay binds the checkpoint history to the TPM, but never reads entries.
+    Without this check, an operator with signing-oracle access can delete an
+    already-extended entry, append a freshly signed checkpoint for the altered
+    log, and extend it: replay and the last-checkpoint check both still pass,
+    because the earlier genuine checkpoints are left in place.
+    """
+    if len(checkpoints) != len(entries):
+        raise AttestationError(
+            f"log has {len(entries)} entries but checkpoint history has "
+            f"{len(checkpoints)} checkpoints"
+        )
+    leaf_hashes = [
+        compute_leaf_hash(
+            index=entry["index"],
+            timestamp=entry["timestamp"],
+            seq_ciphertext=entry["seq_ciphertext"],
+            metadata=entry["metadata"],
+        )
+        for entry in entries
+    ]
+    for size, checkpoint in enumerate(checkpoints, start=1):
+        if compute_root(leaf_hashes[:size]).hex() != checkpoint["root_hash"]:
+            raise AttestationError(
+                f"checkpoint {size} root does not match the first {size} log entries"
+            )
+
+
 def verify_attestation(
+    entries: list[dict],
     checkpoints: list[dict],
     provisioning: dict,
     bundle: dict,
@@ -147,22 +181,31 @@ def verify_attestation(
         raise AttestationError("bundle accumulator does not match checkpoint history")
     if attested["nv_contents"] != expected_accumulator:
         raise AttestationError("certified NV value does not match checkpoint history")
+    check_checkpoint_prefixes(entries, checkpoints)
     return expected_accumulator
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--provisioning", required=True)
+    parser.add_argument("--log", default="synthlog.jsonl")
     parser.add_argument("--checkpoints", default="checkpoints.jsonl")
     parser.add_argument("--bundle", required=True)
     parser.add_argument("--nonce", required=True, help="expected 32-byte nonce in hex")
     parser.add_argument("--ak-public-key", required=True)
+    parser.add_argument("--device-public-key", required=True)
     args = parser.parse_args()
 
+    report = verify_log(
+        args.log, args.checkpoints, load_public_key(args.device_public_key)
+    )
+    if not report.startswith("OK"):
+        raise AttestationError(report)
     provisioning = json.loads(Path(args.provisioning).read_text(encoding="utf-8"))
     bundle = json.loads(Path(args.bundle).read_text(encoding="utf-8"))
     checkpoints = read_checkpoints(args.checkpoints)
     accumulator = verify_attestation(
+        read_log(args.log),
         checkpoints,
         provisioning,
         bundle,
@@ -170,7 +213,8 @@ def main() -> None:
         Path(args.ak_public_key).read_bytes(),
     )
     print(
-        f"OK, {len(checkpoints)} checkpoints, fresh TPM certification, "
+        f"OK, {len(checkpoints)} checkpoints, every checkpoint matches its "
+        f"entry prefix, last checkpoint signed, fresh TPM certification, "
         f"accumulator {accumulator.hex()}"
     )
 

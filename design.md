@@ -351,6 +351,13 @@ auditor verifies all of the following:
 3. The certified NV Name and attributes match the provisioned index.
 4. Recomputing the accumulator from `A_0` and every presented checkpoint
    produces the certified current value.
+5. Every checkpoint `i`'s `root_hash` equals the Merkle root of the first `i`
+   presented log entries. Step 4 binds the checkpoint history to the TPM but
+   never reads entries; this step binds entries to that history. Without it,
+   an operator with signing-oracle access could delete an already-extended
+   entry, sign and extend one new checkpoint for the altered log, and pass
+   step 4 and the last-checkpoint root and signature checks, because the
+   genuine earlier checkpoints remain in place.
 
 Under these assumptions, replacing the log with an earlier prefix cannot pass
 a live audit: the old prefix recomputes an old accumulator value, while the TPM
