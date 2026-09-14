@@ -299,15 +299,114 @@ Mac); the "append-only" property currently holds only because no deletion
 code is written. This must be stated plainly in the write-up. It is not a
 flaw to be hidden; it is a scoped limitation.
 
-In production, append-only would be enforced by hardware:
-- a write-once partition, or
-- a TEE-protected storage area, or
-- a secure element enforcing a monotonic counter.
+### TPM-backed rollback evidence
 
-The prototype **simulates** SE/TEE properties rather than implementing them.
-The optional ATECC608 secure element (Month 2) demonstrates *real* key
-non-extractability — a private key that physically cannot leave the chip —
-which is the one property software alone cannot honestly show.
+The hardware design uses a TPM NV extend index as a content-bound,
+append-only accumulator. This is distinct from the entry's software `index`:
+an integer counter establishes ordering, while an extend accumulator commits
+to the ordered checkpoint contents.
+
+For checkpoint `i`, compute:
+
+```
+checkpoint_commitment_i = SHA256(canonical({
+    "type": "synthesis-log-checkpoint-v1",
+    "tree_size": i,
+    "root_hash": root_hash_i,
+}))
+
+A_i = SHA256(A_(i-1) || checkpoint_commitment_i)
+```
+
+`A_i` is the value produced by `TPM2_NV_Extend`; it is not computed and
+written directly by host software. The auditor recomputes the same accumulator
+from the presented checkpoints and compares it with a TPM certification of the
+NV index.
+
+Provisioning is part of the guarantee. The externally retained provisioning
+record must bind the machine identity to:
+
+- the exact TPM attestation public key, Name, and qualified Name;
+- the NV index handle, Name, public attributes, and initial value `A_0`;
+- an NV extend policy that permits extension but not deletion or arbitrary
+  writes; and
+- the device signing key and auditor encryption public key used by this log.
+
+The NV index must be platform-created and configured for policy deletion such
+that neither the device operator nor normal host software can authorize
+`TPM2_NV_UndefineSpaceSpecial`. Owner, index-password, and arbitrary-write
+authorization must not provide alternate deletion or write paths. Platform
+hierarchy authorization must not be stored on the device. TPM clear must be
+disabled where supported, and the platform-created index must survive an owner
+clear. A destructive reset or TPM replacement is accepted only as a detectable
+device reprovisioning event, never as continuation of the old log identity.
+The deletion policy should use `PolicySigned` under an offline auditor key,
+with a fresh session nonce and command-parameter hash binding authorization to
+the intended `TPM2_NV_UndefineSpaceSpecial` invocation. This remains
+recoverably deletable by the auditor; an unsatisfiable policy is unnecessary.
+
+Platform authorization is a provisioning prerequisite, not an ordinary host
+credential. If system firmware withholds it from the operating system, host
+software cannot create the required index and the machine supports only the
+mutable demonstration unless an OEM or firmware provisioning path is added.
+Falling back to an owner-created index would silently remove the root-resistant
+deletion guarantee and is forbidden for a production enrollment.
+
+For an audit, the auditor sends a fresh unpredictable nonce. The device returns
+`TPM2_NV_Certify` attestation data covering the accumulator's current NV value,
+with the nonce included as qualifying data, plus the TPM's signature. The
+auditor verifies all of the following:
+
+1. The signature is from the attestation key in the provisioning record.
+2. The returned nonce equals the challenge nonce.
+3. The certified NV Name and attributes match the provisioned index.
+4. Recomputing the accumulator from `A_0` and every presented checkpoint
+   produces the certified current value.
+5. Every checkpoint `i`'s `root_hash` equals the Merkle root of the first `i`
+   presented log entries. Step 4 binds the checkpoint history to the TPM but
+   never reads entries; this step binds entries to that history. Without it,
+   an operator with signing-oracle access could delete an already-extended
+   entry, sign and extend one new checkpoint for the altered log, and pass
+   step 4 and the last-checkpoint root and signature checks, because the
+   genuine earlier checkpoints remain in place.
+
+Under these assumptions, replacing the log with an earlier prefix cannot pass
+a live audit: the old prefix recomputes an old accumulator value, while the TPM
+certifies its later value. Replaying an earlier certification also fails
+because it does not contain the fresh nonce. Rewriting, omitting, reordering,
+or forking already-extended checkpoints likewise produces an accumulator that
+does not match the certified value. Once one branch has been extended, the TPM
+cannot return to the predecessor value to certify a sibling branch.
+
+This mechanism does not prove that every physical synthesis reached the
+logging software. A hostile host can omit an event before extension, extend a
+false checkpoint, advance the TPM to cause denial of service, or stop
+responding. Closing that capture gap requires trusted hardware on the physical
+synthesis path. An auditor that cannot issue a live challenge also needs an
+external witness to establish currentness.
+
+The optional TPM append path uses a durable pending journal because a file
+append and an NV extend cannot be one atomic operation. Before extending, it
+records the exact entry and checkpoint bytes, both files' lengths and prefix
+hashes, and the expected accumulator values before and after the extend. On
+recovery, the recorded before value permits the one required extend; the after
+value permits completion of missing or partial file writes without a second
+extend. Any other TPM value or unexpected file content fails closed. A process
+lock serializes honest writers but is not considered a defense against root.
+
+TPM mode is optional at provisioning. A software-only log retains the base
+Merkle and checkpoint behavior. Once a run is TPM-enrolled, TPM failure,
+missing hardware, an unexpected NV Name, or an accumulator mismatch aborts an
+append; the implementation never silently falls back to software-only mode.
+
+The mutable prototype uses an owner-created index so it can be repeatedly
+tested and removed. That configuration demonstrates command integration and
+crash recovery, not resistance to a root operator who can undefine the index.
+The production guarantee requires the platform-created deletion policy above.
+A secure element or TPM-held device signing key additionally provides real key
+non-extractability. Non-extractability authenticates the hardware that signed a
+value, but does not by itself prove that approved software requested the
+signature or that every synthesis was logged.
 
 Detection of *tampering* (root mismatch, bad checkpoint signature) is
 strong. Detection of *absence* (operator deletes the whole log, claims

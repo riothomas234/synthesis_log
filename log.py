@@ -5,8 +5,8 @@ Spec: design.md §9.
 
 Written by the agent (design.md marks this file as agent-OK). Its whole
 job is file plumbing: given "here's a new entry's content," build the
-entry, rebuild the whole Merkle tree over every entry now on disk, sign
-a fresh checkpoint over that tree's root, and write both to disk.
+entry, rebuild the whole Merkle tree over the existing entries plus the new
+one, sign a fresh checkpoint over that tree's root, and write both to disk.
 Delegates all hashing/signing to logentry.py and all tree construction
 to merkletree.py (both treated here as black boxes).
 
@@ -89,6 +89,7 @@ def append_entry(
     auditor_public_key,
     path: str = DEFAULT_LOG_PATH,
     checkpoints_path: str = DEFAULT_CHECKPOINTS_PATH,
+    rollback_guard=None,
 ) -> dict:
     """
     Append one new entry to the log, then rebuild the whole tree and
@@ -104,9 +105,9 @@ def append_entry(
          ever handled — this function never sees seq_ciphertext's
          contents as anything other than an opaque field in the dict
          build_entry hands back.
-      2. A checkpoint: the ENTIRE tree gets rebuilt from every entry now
-         on disk (including the one just written), and the resulting
-         root gets signed fresh. This is "sign every append" per the
+      2. A checkpoint: the ENTIRE tree is rebuilt from the existing entries
+         plus the new one, and the resulting root gets signed fresh. This is
+         "sign every append" per the
          design decision — no batching, no periodic checkpoints, so the
          log is immediately independently verifiable after every single
          append, same as the old chain design's behavior.
@@ -119,6 +120,38 @@ def append_entry(
     timestamp is used for both the entry and the checkpoint produced
     alongside it, since they're conceptually one atomic append.
     """
+    if rollback_guard is not None:
+        with rollback_guard.lock():
+            rollback_guard.recover(path, checkpoints_path)
+            return _append_entry(
+                raw_sequence,
+                metadata,
+                private_key,
+                auditor_public_key,
+                path,
+                checkpoints_path,
+                rollback_guard,
+            )
+    return _append_entry(
+        raw_sequence,
+        metadata,
+        private_key,
+        auditor_public_key,
+        path,
+        checkpoints_path,
+        None,
+    )
+
+
+def _append_entry(
+    raw_sequence,
+    metadata,
+    private_key,
+    auditor_public_key,
+    path,
+    checkpoints_path,
+    rollback_guard,
+) -> dict:
     last = get_last_entry(path)
     index = last["index"] + 1 if last else 0
 
@@ -132,17 +165,7 @@ def append_entry(
         auditor_public_key=auditor_public_key,
     )
 
-    with open(path, "a", encoding="utf-8") as f:
-        # Same reasoning as before this file's rewrite: reuse canonical()
-        # for the on-disk bytes, not a fresh json.dumps() call, so what's
-        # sitting in the file is byte-for-byte what re-canonicalizing
-        # this dict later would produce — no second serialization path
-        # to drift out of sync with the one that matters cryptographically.
-        f.write(canonical(entry).decode("utf-8") + "\n")
-
-    # Rebuild the WHOLE tree from every entry now on disk — full
-    # rebuild per append, per this file's module docstring.
-    all_entries = _read_lines(path)
+    all_entries = _read_lines(path) + [entry]
     leaf_hashes = [bytes.fromhex(e["leaf_hash"]) for e in all_entries]
     root_hash = compute_root(leaf_hashes)
 
@@ -152,6 +175,24 @@ def append_entry(
         timestamp=timestamp,
         private_key=private_key,
     )
+
+    if rollback_guard is not None:
+        rollback_guard.commit(
+            entry=entry,
+            checkpoint=checkpoint,
+            prior_checkpoints=_read_lines(checkpoints_path),
+            log_path=path,
+            checkpoints_path=checkpoints_path,
+        )
+        return entry
+
+    with open(path, "a", encoding="utf-8") as f:
+        # Same reasoning as before this file's rewrite: reuse canonical()
+        # for the on-disk bytes, not a fresh json.dumps() call, so what's
+        # sitting in the file is byte-for-byte what re-canonicalizing
+        # this dict later would produce — no second serialization path
+        # to drift out of sync with the one that matters cryptographically.
+        f.write(canonical(entry).decode("utf-8") + "\n")
 
     with open(checkpoints_path, "a", encoding="utf-8") as f:
         f.write(canonical(checkpoint).decode("utf-8") + "\n")
