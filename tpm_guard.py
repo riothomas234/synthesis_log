@@ -413,12 +413,21 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _file_sha256(path: str) -> str:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError as exc:
+        raise TPMGuardError(f"cannot read provisioning key {path}") from exc
+
+
 def enroll(
     config_path: str,
     nv_index: str,
     command_prefix: list[str],
-    ak_context: str | None = None,
-    ak_public_key_path: str | None = None,
+    ak_context: str,
+    ak_public_key_path: str,
+    device_public_key_path: str,
+    auditor_public_key_path: str,
 ) -> None:
     backend = TPM2ToolsBackend(nv_index, command_prefix)
     name, attributes = backend.public()
@@ -432,14 +441,18 @@ def enroll(
         "initial_value": backend.read().hex(),
         "command_prefix": command_prefix,
     }
-    if (ak_context is None) != (ak_public_key_path is None):
-        raise TPMGuardError("AK context and public-key output must be supplied together")
-    if ak_context is not None:
-        (
-            config["ak_name"],
-            config["ak_qualified_name"],
-            config["ak_attributes"],
-        ) = backend.export_public_key(ak_context, ak_public_key_path)
+    (
+        config["ak_name"],
+        config["ak_qualified_name"],
+        config["ak_attributes"],
+    ) = backend.export_public_key(ak_context, ak_public_key_path)
+    config["ak_public_key_sha256"] = _file_sha256(ak_public_key_path)
+    config["device_signing_public_key_sha256"] = _file_sha256(
+        device_public_key_path
+    )
+    config["auditor_encryption_public_key_sha256"] = _file_sha256(
+        auditor_public_key_path
+    )
     path = Path(config_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical(config) + b"\n")
@@ -451,8 +464,10 @@ def main() -> None:
     enroll_parser = subparsers.add_parser("enroll", help="pin an existing NV index")
     enroll_parser.add_argument("--config", required=True)
     enroll_parser.add_argument("--index", required=True)
-    enroll_parser.add_argument("--ak-context")
-    enroll_parser.add_argument("--ak-public-key")
+    enroll_parser.add_argument("--ak-context", required=True)
+    enroll_parser.add_argument("--ak-public-key", required=True)
+    enroll_parser.add_argument("--device-public-key", required=True)
+    enroll_parser.add_argument("--auditor-public-key", required=True)
     enroll_parser.add_argument(
         "--sudo", action="store_true", help="run tpm2-tools through sudo -n"
     )
@@ -468,6 +483,8 @@ def main() -> None:
             ["sudo", "-n"] if args.sudo else [],
             args.ak_context,
             args.ak_public_key,
+            args.device_public_key,
+            args.auditor_public_key,
         )
         return
 

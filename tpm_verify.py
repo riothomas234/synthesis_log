@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -136,7 +137,27 @@ def verify_attestation(
     bundle: dict,
     expected_nonce: bytes,
     ak_public_key_pem: bytes,
+    device_public_key_pem: bytes,
+    auditor_public_key_pem: bytes,
 ) -> bytes:
+    key_bindings = (
+        ("ak_public_key_sha256", ak_public_key_pem, "AK public key"),
+        (
+            "device_signing_public_key_sha256",
+            device_public_key_pem,
+            "device signing public key",
+        ),
+        (
+            "auditor_encryption_public_key_sha256",
+            auditor_public_key_pem,
+            "auditor encryption public key",
+        ),
+    )
+    for field, public_key_bytes, label in key_bindings:
+        observed = hashlib.sha256(public_key_bytes).hexdigest()
+        if observed != provisioning[field].lower():
+            raise AttestationError(f"{label} does not match provisioning")
+
     if bundle.get("version") != 1:
         raise AttestationError("unsupported attestation bundle version")
     if bytes.fromhex(bundle["nonce"]) != expected_nonce:
@@ -194,6 +215,7 @@ def main() -> None:
     parser.add_argument("--nonce", required=True, help="expected 32-byte nonce in hex")
     parser.add_argument("--ak-public-key", required=True)
     parser.add_argument("--device-public-key", required=True)
+    parser.add_argument("--auditor-public-key", required=True)
     args = parser.parse_args()
 
     report = verify_log(
@@ -211,6 +233,8 @@ def main() -> None:
         bundle,
         bytes.fromhex(args.nonce),
         Path(args.ak_public_key).read_bytes(),
+        Path(args.device_public_key).read_bytes(),
+        Path(args.auditor_public_key).read_bytes(),
     )
     print(
         f"OK, {len(checkpoints)} checkpoints, every checkpoint matches its "

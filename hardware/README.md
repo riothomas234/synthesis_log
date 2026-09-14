@@ -32,8 +32,10 @@ value becomes `A_0` for that log.
 python3 tpm_guard.py enroll \
   --config tpm-guard.json \
   --index 0x01534c47 \
-  --ak-context signing.ctx \
+  --ak-context 0x81010010 \
   --ak-public-key signing.pem \
+  --device-public-key keys/device_public_key.pem \
+  --auditor-public-key keys/auditor_public_key.pem \
   --sudo
 ```
 
@@ -74,7 +76,7 @@ The auditor generates a fresh random 32-byte nonce. On the device:
 python3 tpm_audit.py \
   --config tpm-guard.json \
   --checkpoints checkpoints.jsonl \
-  --signing-context signing.ctx \
+  --signing-context 0x81010010 \
   --nonce "$NONCE_HEX" \
   --output attestation.json
 ```
@@ -90,26 +92,50 @@ python3 tpm_verify.py \
   --bundle attestation.json \
   --nonce "$NONCE_HEX" \
   --ak-public-key signing.pem \
-  --device-public-key keys/device_public_key.pem
+  --device-public-key keys/device_public_key.pem \
+  --auditor-public-key keys/auditor_public_key.pem
 ```
 
 Verification first runs `verify.py`'s checks (last checkpoint root and device
 signature), then checks the ECDSA signature, fresh nonce, attestation type, AK
-Name, NV Name, offset, checkpoint count, the accumulator recomputed from the
-complete checkpoint history, and that every checkpoint's root equals the root
-of the corresponding prefix of log entries. The prefix check is what ties the
-TPM-bound checkpoint history to the entries: without it, an operator with
-signing-oracle access could delete an extended entry, sign and extend one new
-checkpoint for the altered log, and still pass replay.
+Name, NV Name, offset, checkpoint count, all three provisioned public-key
+bindings, the accumulator recomputed from the complete checkpoint history, and
+that every checkpoint's root equals the root of the corresponding prefix of
+log entries. The prefix check is what ties the TPM-bound checkpoint history to
+the entries: without it, an operator with signing-oracle access could delete an
+extended entry, sign and extend one new checkpoint for the altered log, and
+still pass replay.
 
 ## Immutable deployment
 
 After the mutable workflow passes, replace the disposable index with a
 platform-created `policydelete` extend index. Its deletion branch must require
-an offline auditor authorization and `TPM2_CC_NV_UndefineSpaceSpecial`.
-Neither platform authorization nor an auditor deletion private key belongs on
-the device. Test that policy using a deletable auditor-controlled policy before
-creating an intentionally undeletable index.
+an offline auditor signature and `TPM2_CC_NV_UndefineSpaceSpecial`. Use
+`PolicySigned` with a session nonce and command-parameter hash so an
+authorization is fresh and bound to the intended index deletion. Neither
+platform authorization nor the auditor deletion private key belongs on the
+device.
+
+Creating a `policydelete` index requires platform-hierarchy authorization. PC
+firmware commonly keeps that authorization from the operating system. Such a
+machine can run the complete mutable integration and audit workflow but cannot
+be provisioned with the production index from host software; it needs a
+firmware/OEM provisioning path or a TPM platform whose owner controls platform
+authorization. An authorization failure from `tpm2_nvdefine -C p` must not be
+worked around by falling back to an owner-created index.
+
+Test the deletion policy on a disposable software TPM or development platform:
+
+1. Normal owner-authorized extension succeeds.
+2. Ordinary platform or owner deletion fails.
+3. A policy session missing the auditor signature fails inside the TPM.
+4. The auditor-signed `TPM2_NV_UndefineSpaceSpecial` succeeds and frees the
+   handle.
+
+An auditor-deletable index provides the required resistance to device root
+without permanently consuming the handle. An empty or otherwise unsatisfiable
+deletion policy makes the allocation intentionally undeletable and is not
+needed for the normal deployment.
 
 Root can still stop logging, extend garbage, destroy the TPM, or replace the
 machine. Those actions cause denial of service or detectable reprovisioning;

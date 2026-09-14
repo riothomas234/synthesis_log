@@ -340,6 +340,17 @@ hierarchy authorization must not be stored on the device. TPM clear must be
 disabled where supported, and the platform-created index must survive an owner
 clear. A destructive reset or TPM replacement is accepted only as a detectable
 device reprovisioning event, never as continuation of the old log identity.
+The deletion policy should use `PolicySigned` under an offline auditor key,
+with a fresh session nonce and command-parameter hash binding authorization to
+the intended `TPM2_NV_UndefineSpaceSpecial` invocation. This remains
+recoverably deletable by the auditor; an unsatisfiable policy is unnecessary.
+
+Platform authorization is a provisioning prerequisite, not an ordinary host
+credential. If system firmware withholds it from the operating system, host
+software cannot create the required index and the machine supports only the
+mutable demonstration unless an OEM or firmware provisioning path is added.
+Falling back to an owner-created index would silently remove the root-resistant
+deletion guarantee and is forbidden for a production enrollment.
 
 For an audit, the auditor sends a fresh unpredictable nonce. The device returns
 `TPM2_NV_Certify` attestation data covering the accumulator's current NV value,

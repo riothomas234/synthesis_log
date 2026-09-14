@@ -48,13 +48,15 @@ class TPMGuardTests(unittest.TestCase):
         self.log_path = root / "log.jsonl"
         self.checkpoints_path = root / "checkpoints.jsonl"
         self.config_path = root / "tpm.json"
+        self.device_public_key_path = root / "keys" / "device-public.pem"
+        self.auditor_public_key_path = root / "keys" / "auditor-public.pem"
         self.private_key, self.public_key = generate_keypair(
             str(root / "keys" / "device-private.pem"),
-            str(root / "keys" / "device-public.pem"),
+            str(self.device_public_key_path),
         )
         _, self.auditor_public_key = generate_auditor_keypair(
             str(root / "keys" / "auditor-private.pem"),
-            str(root / "keys" / "auditor-public.pem"),
+            str(self.auditor_public_key_path),
         )
         self.backend = FakeTPM()
         self.config_path.write_text(
@@ -155,13 +157,40 @@ class TPMGuardTests(unittest.TestCase):
         provisioning, bundle, public_pem = self.certify(nonce, len(checkpoints))
         self.assertEqual(
             verify_attestation(
-                entries, checkpoints, provisioning, bundle, nonce, public_pem
+                entries,
+                checkpoints,
+                provisioning,
+                bundle,
+                nonce,
+                public_pem,
+                self.device_public_key_path.read_bytes(),
+                self.auditor_public_key_path.read_bytes(),
             ),
             self.backend.value,
         )
         with self.assertRaisesRegex(AttestationError, "bundle nonce"):
             verify_attestation(
-                entries, checkpoints, provisioning, bundle, b"x" * 32, public_pem
+                entries,
+                checkpoints,
+                provisioning,
+                bundle,
+                b"x" * 32,
+                public_pem,
+                self.device_public_key_path.read_bytes(),
+                self.auditor_public_key_path.read_bytes(),
+            )
+        with self.assertRaisesRegex(
+            AttestationError, "auditor encryption public key"
+        ):
+            verify_attestation(
+                entries,
+                checkpoints,
+                provisioning,
+                bundle,
+                nonce,
+                public_pem,
+                self.device_public_key_path.read_bytes(),
+                b"different auditor key",
             )
 
     def test_oracle_deletion_passes_replay_but_fails_prefix_check(self):
@@ -189,7 +218,14 @@ class TPMGuardTests(unittest.TestCase):
         provisioning, bundle, public_pem = self.certify(nonce, len(checkpoints))
         with self.assertRaisesRegex(AttestationError, "checkpoint 2 root"):
             verify_attestation(
-                entries, checkpoints, provisioning, bundle, nonce, public_pem
+                entries,
+                checkpoints,
+                provisioning,
+                bundle,
+                nonce,
+                public_pem,
+                self.device_public_key_path.read_bytes(),
+                self.auditor_public_key_path.read_bytes(),
             )
 
     def certify(self, nonce, checkpoint_count):
@@ -218,6 +254,13 @@ class TPMGuardTests(unittest.TestCase):
             serialization.Encoding.PEM,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         )
+        provisioning["ak_public_key_sha256"] = hashlib.sha256(public_pem).hexdigest()
+        provisioning["device_signing_public_key_sha256"] = hashlib.sha256(
+            self.device_public_key_path.read_bytes()
+        ).hexdigest()
+        provisioning["auditor_encryption_public_key_sha256"] = hashlib.sha256(
+            self.auditor_public_key_path.read_bytes()
+        ).hexdigest()
         return provisioning, bundle, public_pem
 
 
