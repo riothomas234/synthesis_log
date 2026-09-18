@@ -189,3 +189,15 @@ attack_demo_checkpoints.jsonl
 device_private_key.pem
 device_public_key.pem
 *.pem
+keys/
+auditor_keys/
+attack_demo_auditor_keys/
+
+# TPM prototype artifacts (hardware/README.md) — machine/enrollment-specific,
+# not source; a provisioning record belongs with the auditor, not in git
+tpm-guard.json
+attestation.json
+*.pending
+
+# Claude Code local settings — machine-specific, not shared config
+.claude/settings.local.json
