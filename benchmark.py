@@ -37,6 +37,7 @@ from tpm_guard import (
     TPMGuard,
     checkpoint_commitment,
     enroll,
+    extend_value,
     replay_accumulator,
 )
 from tpm_audit import certify
@@ -51,9 +52,11 @@ except ImportError:
 
 EXPERIMENT = "mintbox-tpm-scale"
 SIZES = (0, 1, 10, 100, 1_000, 10_000)
+LIFETIME_SIZES = (0, 1, 10, 100, 1_000, 10_000, 100_000, 1_000_000)
 TPM_SIZES = (0, 1, 10, 100, 1_000)
 PAYLOAD_SIZES = (100, 1_024, 10_240, 102_400)
 BASELINE_PAYLOAD_BYTES = 1_024
+LIFETIME_PAYLOAD_BYTES = 45
 TIME_LIMIT_SECONDS = 120.0
 PROVISIONING_VERSION = 1
 
@@ -98,6 +101,23 @@ class MerkleFrontier:
         return root
 
 
+class MemoryTPMBackend:
+    """In-memory NV-extend backend for measuring guard software overhead."""
+
+    def __init__(self, value: bytes, name: str):
+        self.value = value
+        self.name = name
+
+    def read(self) -> bytes:
+        return self.value
+
+    def public(self) -> tuple[str, str]:
+        return self.name, "ownerwrite|ownerread|nt=0x1|no_da"
+
+    def extend(self, commitment: bytes) -> None:
+        self.value = extend_value(self.value, commitment)
+
+
 def _write_jsonl(path: Path, value: dict) -> None:
     with path.open("ab") as stream:
         stream.write(canonical(value) + b"\n")
@@ -125,23 +145,24 @@ def create_fixture(root: Path, count: int, payload_bytes: int) -> Fixture:
     checkpoints_path.write_bytes(b"")
     frontier = MerkleFrontier()
     sequence = _dna(payload_bytes)
-    for index in range(count):
-        timestamp = f"2026-01-01T00:{index // 60 % 60:02d}:{index % 60:02d}Z"
-        entry = build_entry(
-            index=index,
-            timestamp=timestamp,
-            raw_sequence=sequence,
-            metadata={
-                "benchmark": EXPERIMENT,
-                "length_bp": payload_bytes,
-                "payload_bytes": payload_bytes,
-            },
-            auditor_public_key=auditor_key,
-        )
-        root_hash = frontier.append(bytes.fromhex(entry["leaf_hash"]))
-        checkpoint = build_checkpoint(index + 1, root_hash, timestamp, private_key)
-        _write_jsonl(log_path, entry)
-        _write_jsonl(checkpoints_path, checkpoint)
+    with log_path.open("ab") as log_stream, checkpoints_path.open("ab") as checkpoints_stream:
+        for index in range(count):
+            timestamp = f"2026-01-01T00:{index // 60 % 60:02d}:{index % 60:02d}Z"
+            entry = build_entry(
+                index=index,
+                timestamp=timestamp,
+                raw_sequence=sequence,
+                metadata={
+                    "benchmark": EXPERIMENT,
+                    "length_bp": payload_bytes,
+                    "payload_bytes": payload_bytes,
+                },
+                auditor_public_key=auditor_key,
+            )
+            root_hash = frontier.append(bytes.fromhex(entry["leaf_hash"]))
+            checkpoint = build_checkpoint(index + 1, root_hash, timestamp, private_key)
+            log_stream.write(canonical(entry) + b"\n")
+            checkpoints_stream.write(canonical(checkpoint) + b"\n")
     fixture = Fixture(
         root,
         log_path,
@@ -205,6 +226,13 @@ def _rss_mib() -> float:
     return value / 1024
 
 
+def _reset_peak_rss() -> None:
+    """Discard a Linux peak-RSS value inherited across exec()."""
+    clear_refs = Path("/proc/self/clear_refs")
+    if clear_refs.exists():
+        clear_refs.write_text("5\n", encoding="ascii")
+
+
 def _tpm2b(value: bytes) -> bytes:
     return len(value).to_bytes(2, "big") + value
 
@@ -265,11 +293,6 @@ def _software_operation(name: str, fixture: Fixture, size: int, payload_bytes: i
     )
     public_key = load_public_key(str(fixture.device_public))
     auditor_key = load_auditor_public_key(str(fixture.auditor_public))
-    nonce = bytes.fromhex("42" * 32)
-    entries = read_log(str(fixture.log))
-    checkpoints = read_checkpoints(str(fixture.checkpoints))
-    synthetic = _synthetic_attestation(entries, checkpoints, fixture, nonce)
-
     if name == "restart_initialize":
         def operation():
             serialization.load_pem_private_key(
@@ -281,6 +304,10 @@ def _software_operation(name: str, fixture: Fixture, size: int, payload_bytes: i
     if name == "verify_software":
         return lambda: verify_log(str(fixture.log), str(fixture.checkpoints), public_key)
     if name == "verify_auditor":
+        nonce = bytes.fromhex("42" * 32)
+        entries = read_log(str(fixture.log))
+        checkpoints = read_checkpoints(str(fixture.checkpoints))
+        synthetic = _synthetic_attestation(entries, checkpoints, fixture, nonce)
         provisioning, bundle, ak_public, device_public, auditor_public = synthetic
 
         def operation():
@@ -309,10 +336,42 @@ def _software_operation(name: str, fixture: Fixture, size: int, payload_bytes: i
             str(fixture.log),
             str(fixture.checkpoints),
         )
+    if name == "append_guard_simulated":
+        initial = bytes(32)
+        checkpoints = read_checkpoints(str(fixture.checkpoints))
+        name_value = "000b" + "ab" * 32
+        backend = MemoryTPMBackend(
+            replay_accumulator(initial, checkpoints), name_value
+        )
+        config = fixture.root / "memory-guard.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "nv_index": "memory",
+                    "nv_name": name_value,
+                    "nv_attributes": "ownerwrite|ownerread|nt=0x1|no_da",
+                    "initial_value": initial.hex(),
+                    "command_prefix": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        guard = TPMGuard(config, backend=backend)
+        return lambda: append_entry(
+            _dna(payload_bytes),
+            {"benchmark": EXPERIMENT, "length_bp": payload_bytes},
+            private_key,
+            auditor_key,
+            str(fixture.log),
+            str(fixture.checkpoints),
+            guard,
+        )
     raise ValueError(f"unknown software operation {name}")
 
 
 def worker(args: argparse.Namespace) -> None:
+    _reset_peak_rss()
     source = Fixture(
         Path(args.fixture),
         Path(args.fixture) / "synthlog.jsonl",
@@ -360,7 +419,7 @@ def worker(args: argparse.Namespace) -> None:
                 args.operation, fixture, args.size, args.payload_bytes
             )
             operation()
-            if args.operation == "append_software":
+            if args.operation in ("append_software", "append_guard_simulated"):
                 shutil.rmtree(trial_root)
                 fixture = materialize_prefix(source, trial_root, args.size)
                 operation = _software_operation(
@@ -582,12 +641,42 @@ def run_software(args: argparse.Namespace, raw_path: Path, environment: dict) ->
     fixtures_root = Path(args.output_dir) / "fixtures"
     sizes = (0, 1, 10) if args.quick else SIZES
     payload_sizes = (100, 1_024) if args.quick else PAYLOAD_SIZES
-    baseline = create_fixture(fixtures_root / "baseline", max(sizes), BASELINE_PAYLOAD_BYTES)
-    operations = ("restart_initialize", "append_software", "verify_software", "verify_auditor")
+    if args.lifetime:
+        sizes = (0, 1, 10) if args.quick else LIFETIME_SIZES
+        payload_sizes = ()
+    baseline_root = fixtures_root / "baseline"
+    if args.resume and (baseline_root / "synthlog.jsonl").exists():
+        baseline = Fixture(
+            baseline_root,
+            baseline_root / "synthlog.jsonl",
+            baseline_root / "checkpoints.jsonl",
+            baseline_root / "keys/device_private_key.pem",
+            baseline_root / "keys/device_public_key.pem",
+            baseline_root / "auditor_keys/auditor_private_key.pem",
+            baseline_root / "keys/auditor_public_key.pem",
+        )
+    else:
+        baseline = create_fixture(baseline_root, max(sizes), BASELINE_PAYLOAD_BYTES)
+    operations = ["restart_initialize", "append_software", "verify_software", "verify_auditor"]
+    if args.lifetime:
+        operations.append("append_guard_simulated")
     skip_after: dict[str, int] = {}
     for size in sizes:
-        repetitions = 2 if args.quick else (10 if size <= 1_000 else 5)
+        if args.quick:
+            repetitions = 2
+        elif size <= 1_000:
+            repetitions = 10
+        elif size <= 10_000:
+            repetitions = 5
+        elif size <= 100_000:
+            repetitions = 3
+        else:
+            repetitions = 1
         for operation in operations:
+            if args.lifetime and operation == "restart_initialize" and size != 0:
+                continue
+            if operation == "verify_auditor" and size > 10_000:
+                continue
             if operation in skip_after and size > skip_after[operation]:
                 continue
             if not _prepare_group(
@@ -846,7 +935,11 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[math.ceil(fraction * len(ordered)) - 1]
 
 
-def summarize(raw_path: Path, output_dir: Path) -> None:
+def summarize(
+    raw_path: Path,
+    output_dir: Path,
+    tpm_reference: Path | None = None,
+) -> None:
     rows = [json.loads(line) for line in raw_path.read_text(encoding="utf-8").splitlines() if line]
     groups: dict[tuple, list[dict]] = {}
     for row in rows:
@@ -870,13 +963,28 @@ def summarize(raw_path: Path, output_dir: Path) -> None:
                 "peak_python_heap_mib": max((sample["peak_python_heap_mib"] for sample in samples if sample["peak_python_heap_mib"] is not None), default=""),
             }
         )
-    software_10k = next(
+    baseline_payload = next(
+        row["payload_bytes"]
+        for row in rows
+        if row["operation"] == "append_software"
+    )
+    maximum_entry_count = max(
+        row["entry_count"]
+        for row in summary
+        if row["backend"] == "software" and row["operation"] == "append_software"
+    )
+    projection_operation = (
+        "append_guard_simulated"
+        if any(row["operation"] == "append_guard_simulated" for row in summary)
+        else "append_software"
+    )
+    software_maximum = next(
         (
             row for row in summary
             if row["backend"] == "software"
-            and row["operation"] == "append_software"
-            and row["entry_count"] == 10_000
-            and row["payload_bytes"] == BASELINE_PAYLOAD_BYTES
+            and row["operation"] == projection_operation
+            and row["entry_count"] == maximum_entry_count
+            and row["payload_bytes"] == baseline_payload
             and row["cache_mode"] == "warm"
         ),
         None,
@@ -894,16 +1002,31 @@ def summarize(raw_path: Path, output_dir: Path) -> None:
         )
         if candidate:
             fixed_parts[operation] = candidate
-    if software_10k and len(fixed_parts) == 3:
+    if len(fixed_parts) != 3 and tpm_reference is not None:
+        reference_rows = _read_results(tpm_reference)
+        for operation in ("nv_public", "nv_read", "nv_extend"):
+            samples = [
+                row for row in reference_rows
+                if row["backend"] == "physical_tpm"
+                and row["operation"] == operation
+                and row["cache_mode"] == "warm"
+            ]
+            if samples:
+                elapsed = [row["elapsed_ms"] for row in samples]
+                fixed_parts[operation] = {
+                    "median_ms": statistics.median(elapsed),
+                    "peak_rss_mib": max(row["peak_rss_mib"] for row in samples),
+                }
+    if software_maximum and len(fixed_parts) == 3:
         projected_ms = (
-            software_10k["median_ms"]
+            software_maximum["median_ms"]
             + fixed_parts["nv_public"]["median_ms"]
             + 2 * fixed_parts["nv_read"]["median_ms"]
             + fixed_parts["nv_extend"]["median_ms"]
         )
         summary.append(
             {
-                **software_10k,
+                **software_maximum,
                 "status": "projected",
                 "backend": "physical_tpm_projected",
                 "operation": "append_tpm",
@@ -915,7 +1038,7 @@ def summarize(raw_path: Path, output_dir: Path) -> None:
                 "max_ms": projected_ms,
                 "ops_per_second": 1_000 / projected_ms,
                 "peak_rss_mib": max(
-                    software_10k["peak_rss_mib"],
+                    software_maximum["peak_rss_mib"],
                     *(part["peak_rss_mib"] for part in fixed_parts.values()),
                 ),
             }
@@ -928,6 +1051,7 @@ def summarize(raw_path: Path, output_dir: Path) -> None:
     warm = [row for row in summary if row["cache_mode"] == "warm"]
     measured_warm = [row for row in summary if row["cache_mode"] == "warm" and row["status"] == "measured"]
     environment = rows[0]
+    experiment_name = environment["experiment"]
 
     def lookup(backend, operation, entry_count):
         return next(
@@ -936,36 +1060,36 @@ def summarize(raw_path: Path, output_dir: Path) -> None:
                 if row["backend"] == backend
                 and row["operation"] == operation
                 and row["entry_count"] == entry_count
-                and row["payload_bytes"] == BASELINE_PAYLOAD_BYTES
+                and row["payload_bytes"] == baseline_payload
                 and row["cache_mode"] == "warm"
             ),
             None,
         )
 
-    software_append_10k = lookup("software", "append_software", 10_000)
+    software_append_maximum = lookup("software", "append_software", maximum_entry_count)
     tpm_append_1k = lookup("physical_tpm", "append_tpm", 1_000)
     auditor_10k = lookup("software", "verify_auditor", 10_000)
     software_verify_10k = lookup("software", "verify_software", 10_000)
-    projected = lookup("physical_tpm_projected", "append_tpm", 10_000)
+    projected = lookup("physical_tpm_projected", "append_tpm", maximum_entry_count)
     peak_rss = max(row["peak_rss_mib"] for row in measured_warm)
     findings = ["## Key findings", ""]
     if tpm_append_1k:
         findings.append(f"- Physical TPM append at 1,000 prior entries: {tpm_append_1k['median_ms']:.2f} ms median wall time.")
     if projected:
-        findings.append(f"- Projected physical TPM append at 10,000 prior entries: {projected['median_ms']:.2f} ms, combining measured software scaling with measured TPM command costs.")
-    if software_append_10k:
-        findings.append(f"- Software-only append at 10,000 prior entries: {software_append_10k['median_ms']:.2f} ms median.")
+        findings.append(f"- Projected physical TPM append at {maximum_entry_count:,} prior entries: {projected['median_ms']:.2f} ms, combining measured software scaling with measured TPM command costs.")
+    if software_append_maximum:
+        findings.append(f"- Software-only append at {maximum_entry_count:,} prior entries: {software_append_maximum['median_ms']:.2f} ms median.")
     if software_verify_10k and auditor_10k:
         findings.append(f"- Latest-checkpoint verification at 10,000 entries: {software_verify_10k['median_ms']:.2f} ms; full historical-prefix auditor verification: {auditor_10k['median_ms']:.2f} ms.")
     findings.append(f"- Maximum measured process RSS across warm operations: {peak_rss:.2f} MiB.")
 
     lines = [
-        f"# {EXPERIMENT}", "",
+        f"# {experiment_name}", "",
         "## Method", "",
-        "Latency is wall-clock time on mintbox-c. Warm results exclude one warmup. Cold results include process startup. Peak RSS is total process memory; Python heap is measured with tracemalloc. Synthetic payload generation and fixture copying are outside timed intervals.", "",
+        "Latency is wall-clock time on a Lenovo ThinkCentre. Warm results exclude one warmup. Cold results include process startup. Peak RSS is total process memory; Python heap is measured with tracemalloc. Synthetic payload generation and fixture copying are outside timed intervals.", "",
         f"Host: {environment['cpu_model']}; {environment['ram_bytes'] / (1024 ** 3):.2f} GiB RAM; CPU governor {environment['cpu_governor']}; Python {environment['python']}; cryptography {environment['cryptography']}; tpm2-tools {environment['tpm2_tools']}.", "",
         f"Core source commit: `{environment['git_commit']}`.", "",
-        "The physical TPM is a Nuvoton NPCT75x. Physical measurements use a disposable NV index and the established persistent AK. The 10,000-entry TPM append is projected; all other rows are measured.", "",
+        f"The physical TPM is a Nuvoton NPCT75x. Physical measurements use a disposable NV index and the established persistent AK. The {maximum_entry_count:,}-entry TPM append is projected from measured software scaling and physical TPM command costs.", "",
         *findings, "",
         "## Warm measurements", "",
         "| Status | Backend | Operation | Entries | Payload (B) | n | Median (ms) | p95 (ms) | Peak RSS (MiB) | Python heap (MiB) |",
@@ -978,14 +1102,20 @@ def summarize(raw_path: Path, output_dir: Path) -> None:
             f"| {row['status']} | {row['backend']} | {row['operation']} | {row['entry_count']} | {row['payload_bytes']} | {row['n']} | {row['median_ms']:.2f} | {row['p95_ms']:.2f} | {row['peak_rss_mib']:.2f} | {heap_text} |"
         )
     (output_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    _write_svg(output_dir / "latency.svg", warm, "median_ms", "Median latency (ms)")
-    _write_svg(output_dir / "memory.svg", warm, "peak_rss_mib", "Peak RSS (MiB)")
+    _write_svg(output_dir / "latency.svg", warm, "median_ms", "Median latency (ms)", baseline_payload)
+    _write_svg(output_dir / "memory.svg", warm, "peak_rss_mib", "Peak RSS (MiB)", baseline_payload)
 
 
-def _write_svg(path: Path, rows: list[dict], field: str, title: str) -> None:
+def _write_svg(
+    path: Path,
+    rows: list[dict],
+    field: str,
+    title: str,
+    baseline_payload: int,
+) -> None:
     plotted = [
         row for row in rows
-        if row["payload_bytes"] == BASELINE_PAYLOAD_BYTES
+        if row["payload_bytes"] == baseline_payload
         and row[field] != ""
         and row["operation"] != "append_payload_sweep"
     ]
@@ -1019,6 +1149,13 @@ def _write_svg(path: Path, rows: list[dict], field: str, title: str) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    global BASELINE_PAYLOAD_BYTES, EXPERIMENT, SIZES
+    if args.lifetime:
+        BASELINE_PAYLOAD_BYTES = LIFETIME_PAYLOAD_BYTES
+        EXPERIMENT = "mintbox-lifetime-scale"
+        SIZES = LIFETIME_SIZES
+        if args.output_dir == f"profiling/mintbox-tpm-scale":
+            args.output_dir = "profiling/mintbox-lifetime-scale"
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_path = output_dir / "raw.jsonl"
@@ -1030,7 +1167,11 @@ def run(args: argparse.Namespace) -> None:
     baseline = run_software(args, raw_path, environment)
     if args.tpm_index:
         run_physical(args, raw_path, environment, baseline)
-    summarize(raw_path, output_dir)
+    summarize(
+        raw_path,
+        output_dir,
+        Path(args.tpm_reference) if args.tpm_reference else None,
+    )
 
 
 def main() -> None:
@@ -1044,9 +1185,12 @@ def main() -> None:
     run_parser.add_argument("--sudo", action="store_true")
     run_parser.add_argument("--resume", action="store_true")
     run_parser.add_argument("--quick", action="store_true")
+    run_parser.add_argument("--lifetime", action="store_true")
+    run_parser.add_argument("--tpm-reference")
     run_parser.add_argument("--source-commit")
     report_parser = subparsers.add_parser("report")
     report_parser.add_argument("--output-dir", default=f"profiling/{EXPERIMENT}")
+    report_parser.add_argument("--tpm-reference")
     worker_parser = subparsers.add_parser("worker", help=argparse.SUPPRESS)
     worker_parser.add_argument("--operation", required=True)
     worker_parser.add_argument("--fixture", required=True)
@@ -1059,7 +1203,11 @@ def main() -> None:
         run(args)
     elif args.command == "report":
         output_dir = Path(args.output_dir)
-        summarize(output_dir / "raw.jsonl", output_dir)
+        summarize(
+            output_dir / "raw.jsonl",
+            output_dir,
+            Path(args.tpm_reference) if args.tpm_reference else None,
+        )
     else:
         worker(args)
 

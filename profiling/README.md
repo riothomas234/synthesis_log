@@ -27,6 +27,21 @@ Regenerate summaries and dependency-free SVG plots from existing raw data:
 python3 benchmark.py report --output-dir profiling/mintbox-tpm-scale
 ```
 
+Run the lifetime-capacity profile with one representative 45-base sequence
+length and direct measurements through one million log entries:
+
+```sh
+python3 benchmark.py run \
+  --lifetime \
+  --output-dir profiling/mintbox-lifetime-scale \
+  --tpm-reference profiling/mintbox-tpm-scale/raw.jsonl
+```
+
+The lifetime profile measures linear append and verification paths directly,
+but stops the quadratic historical-prefix auditor check at 10,000 entries. It
+projects physical-TPM append latency from the measured physical command costs
+in the reference result set rather than performing a million NV writes.
+
 The output directory contains:
 
 - `raw.jsonl`: one durable record per observation, with milliseconds and MiB.
@@ -34,6 +49,6 @@ The output directory contains:
 - `report.md`: methodology and key findings.
 - `latency.svg` and `memory.svg`: log-scaled entry-count plots.
 
-The named `mintbox-tpm-scale` result set was measured on `mintbox-c`. Its
+The named `mintbox-tpm-scale` result set was measured on a Lenovo ThinkCentre. Its
 10,000-entry physical TPM append is explicitly labeled as a projection from
 measured software scaling and measured TPM command costs.
